@@ -1,4 +1,7 @@
 # Changelog
+## 3.17.4 - July 19, 2022
+* [Feature] Change behavior of global search for IDs (Not yet for production) [PR #361](https://github.com/BV-BRC/bvbrc_website/pull/361)
+
 ## 3.17.3 - July 19, 2022
 * [Update] Rewrite to currently configured base url [PR #360](https://github.com/BV-BRC/bvbrc_website/pull/360)
 * [Bug] Fix a typo [PR #359](https://github.com/BV-BRC/bvbrc_website/pull/359)
