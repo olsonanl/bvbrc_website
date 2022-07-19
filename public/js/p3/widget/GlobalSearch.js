@@ -27,7 +27,7 @@ define([
     var featureIds = extractFeatureIds(query);
     var genomeIds = extractGenomeIds(query);
 
-    if (searchOption != "option_feature_ids" && searchOption != "option_genome_ids")
+    if (searchOption == "option_quick")
     {
       if (featureIds.length == 1)
       {
@@ -47,10 +47,20 @@ define([
       {
 	searchOption = "option_genome_ids";
       }
+      else
+      {
+	searchOption = "option_and";
+      }
     }
     
     if (searchOption == "option_genome_ids")
     {
+      if (genomeIds.length == 1)
+      {
+	Topic.publish('/navigate', { href: '/view/Genome/' + genomeIds[0] });
+	return;
+      }
+
       var idlist = genomeIds.join(",")
       q = "eq(*,*)&genome(in(genome_id,(" + idlist + ")))";
       return { 'query': q, 'effectiveOption' : searchOption };
@@ -58,6 +68,11 @@ define([
 
     if (searchOption == "option_feature_ids")
     {
+      if (featureIds.length == 1)
+      {
+	Topic.publish('/navigate', { href: '/view/Feature/' + featureIds[0] });
+	return;
+      }
       var idlist = featureIds.map(function(x) { return x.replace("|", "%7C") }).join(",");
       q = "(in(patric_id,(" + idlist + ")))";
       return { 'query': q, 'effectiveOption' : searchOption };
