@@ -6,7 +6,8 @@ define([
   './WorkspaceExplorerView', 'dojo/dom-construct', '../WorkspaceManager', 'dojo/store/Memory',
   './Uploader', 'dijit/layout/BorderContainer', 'dojo/dom-attr', 'dijit/TooltipDialog', 'dijit/popup',
   'dijit/form/Button', 'dojo/_base/Deferred', 'dijit/form/CheckBox', 'dojo/topic', 'dijit/Tooltip',
-  'dijit/registry', 'dgrid/editor', './formatter', 'dijit/form/FilteringSelect', 'dijit/form/Select'
+  'dijit/registry', 'dgrid/editor', './formatter', 'dijit/form/FilteringSelect', 'dijit/form/Select',
+  '../store/AuthQueryReadStore'
 ], function (
   declare, WidgetBase, on, lang, query,
   domClass, Templated, WidgetsInTemplate,
@@ -15,7 +16,8 @@ define([
   Grid, domConstr, WorkspaceManager, Memory,
   Uploader, BorderContainer, domAttr, TooltipDialog, popup,
   Button, Deferred, CheckBox, Topic, Tooltip,
-  registry, editor, formatter, FilteringSelect, Select
+  registry, editor, formatter, FilteringSelect, Select,
+  QueryReadStore
 ) {
 
   return declare([WidgetBase, Templated, WidgetsInTemplate], {
@@ -110,7 +112,7 @@ define([
       if (!val) return; // for group selection (hacky)
 
       var self = this;
-
+      console.log("SET " + val);
       // remove trailing '/' in path for consistency
       // var oldWorkspace = this.extractWorkspace(this.path);
       this.path = val[val.length - 1] === '/' ? val.substring(0, val.length - 1) : val;
@@ -193,12 +195,16 @@ define([
     _setTypeAttr: function (type) {
       this.type = Array.isArray(type) ? type : [type];
 
+      if (this.store) {
+        this.store.set('type', type);
+      }
       if (this.grid) {
         this.grid.set('types', (['folder'].concat(this.type)));
       }
-      this.cancelRefresh();
-      // this.refreshWorkspaceItems(this.extractWorkspace(this.path));
-      this.refreshWorkspaceItems();
+
+      // this.cancelRefresh();
+      // // this.refreshWorkspaceItems(this.extractWorkspace(this.path));
+      // this.refreshWorkspaceItems();
     },
 
     // sets value of object selector dropdown
@@ -632,6 +638,15 @@ define([
 
     onSearchChange: function (value) {
       this.set('value', value);
+      var idx = value.lastIndexOf('/');
+      if (idx >= 0)
+      {
+        this.set('path', value.substr(0,idx));
+      }
+      else
+      {
+        this.set('path', value);
+      }
       this.onChange(value);
       this.validate(true);
     },
@@ -655,6 +670,10 @@ define([
     onChange: function (value) {
     },
 
+    onReady: function (value) {
+      console.log("READY");
+    },
+
     onSelection: function () {
       /* can be overwritten */
     },
@@ -674,7 +693,16 @@ define([
       // else {
       // this.refreshWorkspaceItems();
       // }
-      Topic.subscribe('/refreshWorkspace', lang.hitch(this, 'refreshWorkspaceItems'));
+      console.log("WOS startup onlyWritable=" + this.onlyWritable);
+      console.log("attached at " + this.dojoAttachPoint);
+      this.store = new QueryReadStore({
+        url: 'https://p3.theseed.org/services/WorkspaceCompletion',
+        writableWorkspaces: this.onlyWritable,
+        type: this.type,
+        workspaces: [WorkspaceManager.getDefaultFolder('home')],
+      });
+      this.searchBox.set('store', this.store);
+      // Topic.subscribe('/refreshWorkspace', lang.hitch(this, 'refreshWorkspaceItems'));
       this.searchBox.set('disabled', this.disabled);
       this.searchBox.set('required', this.required);
       this.searchBox.set('placeHolder', this.placeHolder);
@@ -684,6 +712,13 @@ define([
 
     labelFunc: function (item, store) {
       var label = '<div style="font-size:1em; border-bottom:1px solid grey;">/';
+      if ('r' in item && 'i' in item)
+      {
+        item = item.i;
+      }
+      if (!('timestamp' in item)) {
+        item.timestamp = Date.parse(item.creation_time);
+      }
       var pathParts = item.path.split('/');
       var workspace = pathParts[2]; // home
       var firstDir = pathParts[3]; // first level under home or file name

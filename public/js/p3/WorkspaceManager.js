@@ -242,6 +242,8 @@ define([
           return '/' + [this.userId, 'home', 'Experiments'].join('/');
         case 'experiment_group':
           return '/' + [this.userId, 'home', 'Experiment Groups'].join('/');
+        case 'home':
+          return '/' + [this.userId, 'home'].join('/');
 
         default:
           return '/' + this.userId;
