@@ -69,6 +69,13 @@ define([
         });
         serverQuery.sort = sortInfo.join(',');
       }
+      // Don't perform an empty query. Testing to see if this works reasonably
+      // with the reset behavior on the FilteringSelect.
+      if (!request.hasOwnProperty("query") || request.query.name === "" || request.query.name === "*") {
+        this._numRows = 0;
+        this._items = [];
+        fetchHandler(this._items, request, this._num_Rows);
+      }
       // Compare the last query and the current query by simply json-encoding them,
       // so we dont have to do any deep object compare ... is there some dojo.areObjectsEqual()???
       if (this.doClientPaging && this._lastServerQuery !== null &&
