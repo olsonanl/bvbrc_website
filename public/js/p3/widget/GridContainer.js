@@ -612,7 +612,7 @@ define([
             console.error('AdvancedDownload error:', e);
           }
         },
-        false
+        true
       ], [
         'Services',
         'fa icon-cog fa-2x',
