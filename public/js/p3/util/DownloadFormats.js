@@ -101,7 +101,7 @@ define([], function () {
     // Annotation/other sequence formats
     'gff': {
       label: 'GFF',
-      mimeType: 'text/gff3',
+      mimeType: 'application/gff',
       extension: '.gff',
       category: 'sequence',
       serverSide: true,
