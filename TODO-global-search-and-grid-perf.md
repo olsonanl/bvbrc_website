@@ -63,10 +63,39 @@ Environments referenced:
   state-derived query is set (construct with no query / guard `onFirstView` when state is pending).
   Likely affects all grid tabs; cost scales with collection size.
 
-- [ ] **Fix broken `.eslintrc.json`** (pre-existing, unrelated but blocks `npm test`)
-  **Alpha: fix NOT merged — problem present on alpha.**
-  Invalid rule entry `_comment_reactivate_later` has a severity of `"block-scoped-var"` instead of
-  0/1/2, so ESLint fails config validation for every file. One-line fix (remove/repair the key).
+- [x] **Fix broken `.eslintrc.json` + mute legacy debt + align ecmaVersion**
+  **Done on branch `fix/eslint-config` (off `alpha`), NOT yet merged/pushed.** Three commits:
+  (1) removed invalid `_comment_reactivate_later` rule key (severity was `"block-scoped-var"` not
+  0/1/2 → ESLint failed config validation for every file, so lint ran on nothing); (2) muted
+  ~16.4k pure-formatting/`strict` findings, keeping correctness rules (no-undef, no-unused-vars,
+  etc.) → 16,768 → ~400 real findings; (3) `ecmaVersion` 8 → 2020 to match the browser runtime for
+  raw-served modules (see build-target note below). Result: `eslint public/js/p3` runs with 0 parse
+  errors, all real signal.
+
+- [ ] **Make `buildClient.sh` fail when the underlying Dojo/Closure build fails**
+  **Alpha: NOT done — present on alpha and main.** `buildClient.sh` is `#!/bin/sh` with no
+  `set -e`. It calls `./util/buildscripts/build.sh --profile ./release.profile.js --release` at
+  line ~46 and then unconditionally continues (`echo "Finished Dojo build"`, the Auspice build,
+  `echo "Done"`) without checking `$?`. `build.sh` DOES return the Dojo builder's exit code (its
+  last statement is the `node`/`java` build invocation), so the failure is available — it's just
+  ignored. Consequence: a broken optimize step (e.g. Closure choking on syntax it can't parse)
+  leaves a **stale/unoptimized release on disk** while the script reports success. Fix: add
+  `set -e` (and/or explicit `|| exit 1` after the build.sh call and the make_bundle2.sh call), so a
+  non-zero build aborts with a non-zero exit. Verify the Dojo builder actually returns non-zero on
+  optimize errors (it logs `error(...)` lines in build-report.txt — confirm those propagate to the
+  exit code, since Dojo sometimes logs errors but exits 0).
+
+- [ ] **CI guard: catch ES2020+ syntax landing in statically-layered modules**
+  **Alpha: NOT done.** Latent gap exposed by the ecmaVersion work. The bundled Closure compiler
+  (`public/js/util/closureCompiler/compiler.jar`, **v20200112**) maxes out at `ECMASCRIPT_2019` and
+  cannot parse ES2020 syntax (optional chaining `?.`, nullish `??`). `release.profile.js` sets
+  `languageIn: ECMASCRIPT_2019`. Raw/dynamically-loaded modules (e.g. `viewer/SFVT.js`, loaded via
+  `'p3/widget/viewer/' + type` in `p3app.js`) bypass Closure and can safely use ES2020 — but if
+  ES2020 syntax lands in a **statically-layered** module, it will break the Closure build. Once the
+  build-fails-on-error item above is done, that break becomes visible; a cheaper early guard would
+  be an ESLint override capping `ecmaVersion` at 2019 for the layered subset, or a grep check for
+  `?.`/`??` in layered paths. (Longer term: upgrade the Closure jar to a version supporting ES2020,
+  which would let the whole app move to ES2020 — but that's a broad recompile with QA risk.)
 
 ---
 

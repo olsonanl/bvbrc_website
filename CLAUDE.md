@@ -23,7 +23,34 @@ npm test
 
 # Initialize git submodules (required after clone)
 git submodule update --init
+
+# Build the optimized client (Dojo build via Closure) for production
+./buildClient.sh
 ```
+
+## Production Build (`buildClient.sh`)
+
+`buildClient.sh` produces the optimized `public/js/release/` layers served in production (the
+versioned `js/<version>/` paths). It pins the Archaeopteryx submodule, regenerates `bundle2.js`,
+then runs the Dojo build: `public/js/util/buildscripts/build.sh --profile ./release.profile.js
+--release`, which optimizes layers with the Closure compiler.
+
+**ES version constraint (important):** The bundled Closure compiler
+(`public/js/util/closureCompiler/compiler.jar`) is **v20200112**, whose max `--language_in` is
+`ECMASCRIPT_2019` — it **cannot parse ES2020 syntax** (optional chaining `?.`, nullish `??`).
+`release.profile.js` sets `languageIn: ECMASCRIPT_2019`, `languageOut: ECMASCRIPT_2018`.
+- **Statically-layered modules** (reachable via static `require`/`define` arrays) go through Closure
+  → must stay within **ES2019**. Adding `?.`/`??` to one of these breaks the build.
+- **Dynamically-loaded / raw-served modules** (e.g. viewers loaded via `'p3/widget/viewer/' + type`
+  in `p3app.js`, like `viewer/SFVT.js`) bypass Closure and are served raw to the browser, so they
+  may use ES2020+ (the browser supports it). This is why ESLint's `ecmaVersion` is set to 2020 (it
+  lints both sets; the runtime/browser is the real target for raw-served files) while the build
+  stays at ES2019.
+
+**Known caveat — build failures are currently silent:** `buildClient.sh` (`#!/bin/sh`, no `set -e`)
+does not check the exit code of `build.sh`, so a failed optimize step leaves a stale/unoptimized
+`release/` on disk while the script still prints "Done". Treat a build as suspect unless you confirm
+`build-report.txt` is clean. (Tracked in `TODO-global-search-and-grid-perf.md`.)
 
 ## Architecture
 
