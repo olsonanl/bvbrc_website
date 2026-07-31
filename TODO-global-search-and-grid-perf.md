@@ -9,11 +9,16 @@ Environments referenced:
 - **alpha** = alpha.bv-brc.org (3.59.1, production-like API) — newer code, WITHOUT distributed-query changes
 - **test** = localhost:3000 (3.59.1, same API as alpha) — newer code, WITH distributed-query changes
 
+**Alpha-merge status** is called out per item (verified against `alpha/alpha` on 2026-07-31):
+- The two ✅ code changes live on `feature/global-search-incremental` and are **NOT yet merged to alpha**.
+- The client-side TODO *fixes* are **not on alpha** — i.e. the underlying problems (join on count
+  fan-out, join-key shadowing, GridContainer double-fetch, broken eslintrc) are all still present on alpha.
+
 ---
 
 ## ✅ Done (branch `feature/global-search-incremental`, off `alpha`)
 
-- [x] **Incremental global-search rendering** (`4b925a2f9`)
+- [x] **Incremental global-search rendering** (`4b925a2f9`) — **Alpha: NOT merged** (on `feature/global-search-incremental`)
   `public/js/p3/widget/AdvancedSearch.js`. Replaced the single batched `query/` POST (awaited all
   15 categories → page blocked ~16–20s on the slowest) with 15 independent per-category requests.
   Skeleton with spinners paints immediately; each cell + Top Matches block fills as its own
@@ -21,7 +26,7 @@ Environments referenced:
   (genome_feature, sp_gene) last. Per-search token discards superseded responses; failed
   categories show `—`. Verified against test API: fast cells ~3s, join cells ~13s, no console errors.
 
-- [x] **Fixed-width count-grid columns** (`6ee3326fc`)
+- [x] **Fixed-width count-grid columns** (`6ee3326fc`) — **Alpha: NOT merged** (on `feature/global-search-incremental`)
   `table-layout:fixed; width:100%` + `33.33%` cells + ellipsis, so columns don't reflow as
   results arrive. Verified: column left/width identical loading vs loaded.
 
@@ -30,6 +35,7 @@ Environments referenced:
 ## 🔧 Client-side, outstanding (this repo)
 
 - [ ] **Drop the genome-join on the global-search COUNT fan-out**
+  **Alpha: fix NOT merged — problem present on alpha** (join code shipped in PR #1330).
   `public/js/p3/util/buildGlobalSearchQuery.js`. The `genome(and(gt(completion_date,NOW-1YEARS),
   ne(genome_status,Deprecated)))` crossCollection join was added (PR #1330) to speed up large-taxa
   *grid reads*, but Top Matches only needs `numFound`. On the count fan-out the join is net-negative:
@@ -39,6 +45,7 @@ Environments referenced:
   the actual cost.
 
 - [ ] **Fix the dead-code join-key shadowing for protein_feature / protein_structure**
+  **Alpha: fix NOT merged — problem present on alpha** (shipped in PR #1330).
   `buildGlobalSearchQuery.js`. Both targets are in BOTH `genomeScopeOnlyTargets` and
   `wrappedPropByTarget`. The `genomeScopeOnlyTargets` branch is checked first and returns, so the
   intended typed join (`to(protein_feature_id)` / `to(protein_structure_id)` via
@@ -47,6 +54,7 @@ Environments referenced:
   from `genomeScopeOnlyTargets` or reorder the dispatch.
 
 - [ ] **Suppress the unfiltered construction-time grid query (GridContainer double-fetch)**
+  **Alpha: fix NOT merged — problem present on alpha** (long-standing, also on `main`).
   `public/js/p3/widget/GridContainer.js` `startup()` (~2161). On genome-view tab load the grid
   queries twice: once at construction with NO genome filter (an UNFILTERED query over the whole
   collection — captured `protein_structure` returning `0-200/32,167,507`), then again with
@@ -56,6 +64,7 @@ Environments referenced:
   Likely affects all grid tabs; cost scales with collection size.
 
 - [ ] **Fix broken `.eslintrc.json`** (pre-existing, unrelated but blocks `npm test`)
+  **Alpha: fix NOT merged — problem present on alpha.**
   Invalid rule entry `_comment_reactivate_later` has a severity of `"block-scoped-var"` instead of
   0/1/2, so ESLint fails config validation for every file. One-line fix (remove/repair the key).
 
@@ -63,7 +72,12 @@ Environments referenced:
 
 ## 🗄️ Backend / data-API session (separate Claude context)
 
+_These live in the data_api service repo, not this web repo, so "alpha merge" refers to which
+data-API backend exhibits the behavior. alpha + test are pointed at the same production-like API;
+the distributed-query changes are deployed on the **test** backend only, not alpha's._
+
 - [ ] **protein_feature distributed-query regression**
+  **Backend: regression present on the distributed-query (test) backend only; alpha backend is fine (29ms).**
   Identical Solr query (byte-for-byte params) is **29ms on alpha vs 15,675ms on test**, both
   returning 0. Regression is entirely in the distributed-query backend path, not the query.
   Runnable queries + bisection cases + questions are in
@@ -72,12 +86,14 @@ Environments referenced:
   protein_structure join *improves* 870× (9.6s→11ms) on the same stack?
 
 - [ ] **genome_feature (16.8s) / sp_gene (20.5s) join cost**
+  **Backend: slow on both alpha and test backends** (distributed-query changes barely help; still 16–26s).
   Distributed-query changes barely help these (vs the 28–870× wins on pathway/subsystem/
   protein_structure). Determine whether the crossCollection join can be pushed down / cached for
   these cores the way it is for the others. (Client-side mitigation above may make this moot for
   Top Matches, but the join still matters for scoped grid views.)
 
 - [ ] **(Defense-in-depth) Make client abort shed backend work**
+  **Backend: not implemented on any backend** (no res.on('close') / Solr timeAllowed anywhere).
   data_api `querySOLR` (paginated path) has no `res.on('close')` / `req.aborted` handling, so a
   browser abort never destroys the upstream Solr socket and Solr has no `timeAllowed` /
   task-cancellation — aborted queries run to completion. Adding `res.on('close')` → destroy Solr
