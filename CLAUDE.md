@@ -163,6 +163,17 @@ Use RQL (Resource Query Language):
 state.search + '&' + state.hashParams.filter
 ```
 
+### RQL Queries in HTML Attributes (HTML-entity decoding pitfall)
+
+RQL queries are joined with `&` (e.g. `keyword(carsonella)&gt(completion_date,NOW-1YEARS)&ne(genome_status,Deprecated)`). When such a query is **string-concatenated into an HTML `href` and rendered via `innerHTML`** (or `set('content', ...)`), the browser's HTML parser decodes `&gt`, `&lt`, `&ge`, `&le` into `>`, `<`, etc. — **even without a trailing `;`**, because these are legacy named entities. This silently corrupts the query: `&gt(completion_date,...)` becomes `>(completion_date,...)`, which the rql parser mis-parses (gluing `>` onto the previous token, e.g. producing a bogus `keywordgt` operator → Solr `400 undefined field object`). Note `&ne`, `&and`, `&or`, `&eq` are NOT entities, so only the `gt`/`lt`/`ge`/`le` comparison operators corrupt.
+
+**Rules:**
+- Prefer navigating via `Topic.publish('/navigate', { href: query })` — the router uses `pushState`, which does NOT HTML-decode. This is why `GlobalSearch.js` is safe.
+- When you MUST embed a query into an HTML `href` string that will be rendered as HTML, HTML-escape it first (`&`→`&amp;`, `"`→`&quot;`). The browser decodes `&amp;` back to `&`, so navigation is correct and `&gt(` is preserved. Reuse the `escapeHtml` pattern in `public/js/p3/util/QueryToEnglish.js`.
+- Prefer building anchors with `domConstruct.create('a', { href: query })` (DOM attribute assignment, no HTML parsing) over concatenating into an innerHTML string.
+
+`AdvancedSearch.js` exhibited this bug in its `format*` result-link builders (rendered via `this.viewer.innerHTML`); `GlobalSearch.js` did not (Topic navigate).
+
 ### Visualization Components
 - D3.js for custom visualizations (charts, domain viewers)
 - Cytoscape for network graphs
