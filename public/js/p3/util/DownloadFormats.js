@@ -674,6 +674,24 @@ define([], function () {
     },
 
     /**
+     * Get the Solr uniqueKey field for a data type. The streaming/export download
+     * path uses cursorMark, which REQUIRES the collection's uniqueKey to be part of
+     * the sort — otherwise Solr rejects the query with HTTP 400. Most collections
+     * use 'id'; the genome-family collections use their domain id instead (and have
+     * no 'id' field at all).
+     * @param {string} dataType - Data type
+     * @returns {string} uniqueKey field name
+     */
+    getUniqueKey: function (dataType) {
+      switch (dataType) {
+        case 'genome': return 'genome_id';
+        case 'genome_feature': return 'feature_id';
+        case 'genome_sequence': return 'sequence_id';
+        default: return 'id';
+      }
+    },
+
+    /**
      * Get the default ID field for a data type (used for FASTA sequence ID)
      * @param {string} dataType - Data type
      * @returns {string} Default ID field name

@@ -83,13 +83,19 @@ define([
     // Without these, the server returns Content-Length: 0 (no results).
     // This matches the pattern used in DownloadTooltipDialog.js and other working download code.
     //
-    // Build sort clause: use sortField, and if it's different from the primary key,
-    // add the primary key as a secondary sort to ensure deterministic ordering.
-    var sortClause = 'sort(+' + sortField;
-    if (sortField !== pk) {
-      sortClause += ',+' + pk;
-    }
-    sortClause += ')';
+    // Build sort clause: sortField, then the primary key, then the collection's Solr
+    // uniqueKey as the final tiebreaker. The uniqueKey is REQUIRED: the streaming export
+    // path uses cursorMark, which Solr rejects (HTTP 400) unless the uniqueKey is part of
+    // the sort. Collections whose sortField/pk are non-unique (e.g. subsystem's
+    // subsystem_id, pathway's pathway_id) would otherwise fail.
+    var uniqueKey = DownloadFormats.getUniqueKey(spec.dataType);
+    var sortFields = [];
+    [sortField, pk, uniqueKey].forEach(function (f) {
+      if (f && sortFields.indexOf(f) === -1) {
+        sortFields.push(f);
+      }
+    });
+    var sortClause = 'sort(+' + sortFields.join(',+') + ')';
 
     if (query) {
       query += '&' + sortClause + '&limit(2500000)';
