@@ -201,6 +201,10 @@ define([
         if (this.queryDescriptor.selectedIds && this.queryDescriptor.selectedIds.length > 0) {
           context.selection = this.queryDescriptor.selectedIds;
         }
+        // Carry selected row objects (transient) for cross-collection linkField remapping
+        if (this.queryDescriptor.selectedRows && this.queryDescriptor.selectedRows.length > 0) {
+          context.selectedRows = this.queryDescriptor.selectedRows;
+        }
       } else {
         // Fall back to containerType for data type
         if (this.containerType) {
@@ -588,6 +592,26 @@ define([
       var linkField = (formatOverride && formatOverride.linkField) ||
                       (format && format.linkField) || null;
       var targetSortField = (formatOverride && formatOverride.sortField) || null;
+
+      // Cross-collection + selected scope: the target is queried by linkField, but the
+      // selection holds SOURCE-collection primary keys (e.g. sp_gene 'id' UUIDs). The
+      // selected grid rows carry the linkField directly, so remap selectedIds to those
+      // values here — the executor then queries the target directly, no source prefetch.
+      // Skip when linkField === sourcePrimaryKey (selectedIds are already linkField values,
+      // e.g. genome grid → feature accession, both 'genome_id').
+      if (recordsData.scope === 'selected' && sourceDataType
+          && linkField && linkField !== sourcePrimaryKey) {
+        var rows = qd.selectedRows || this.context.selectedRows;
+        if (rows && rows.length > 0) {
+          var mapped = rows
+            .map(function (r) { return r && typeof r === 'object' ? r[linkField] : null; })
+            .filter(function (v) { return v !== null && v !== undefined && v !== ''; });
+          if (mapped.length > 0) {
+            selectedIds = mapped;
+            primaryKey = linkField;
+          }
+        }
+      }
 
       return {
         // Format info

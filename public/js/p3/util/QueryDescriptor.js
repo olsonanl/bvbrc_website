@@ -335,6 +335,10 @@ define([
         // These are the primary key values of selected records
         selectedIds: options.selectedIds || null,
 
+        // Selected row objects (transient, download-only — not persisted to saved searches).
+        // Retained so cross-collection downloads can read a non-pk linkField off the rows.
+        selectedRows: options.selectedRows || null,
+
         // Display (generated lazily if needed)
         displayQuery: options.displayQuery || '',
 
@@ -438,8 +442,18 @@ define([
 
       // Extract selected IDs if selection is provided
       var selectedIds = null;
+      var selectedRows = null;
       if (options.selection && options.selection.length > 0) {
         selectedIds = extractSelectedIds(options.selection, primaryKey);
+        // Keep the selected row objects when they carry field data. Cross-collection
+        // sequence downloads (e.g. sp_gene → genome_feature) need a linkField (feature_id)
+        // that isn't the grid's primary key; the rows carry it directly, so we retain
+        // them to avoid a lossy pk-only reduction (and an otherwise-needed prefetch).
+        // Transient: only the download path passes options.selection — SaveSearch does
+        // not — so this is never persisted into saved searches.
+        if (typeof options.selection[0] === 'object') {
+          selectedRows = options.selection;
+        }
       }
 
       return this.create({
@@ -448,6 +462,7 @@ define([
         source: 'grid',
         primaryKey: primaryKey,
         selectedIds: selectedIds,
+        selectedRows: selectedRows,
         visibleColumns: visibleColumns.length > 0 ? visibleColumns : null,
         availableColumns: availableColumns.length > 0 ? availableColumns : null
       });

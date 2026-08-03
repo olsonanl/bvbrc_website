@@ -267,6 +267,11 @@ define([
 
       // Cross-collection download: the format targets a different collection than the
       // source grid. Fetch linking IDs from the source, then download from the target.
+      //
+      // In 'selected' scope the wizard has already resolved the target linkField values
+      // from the selected grid rows (which carry the linkField directly), so selectedIds
+      // are the TARGET collection's key values and we query it directly — no prefetch.
+      // Only 'all'/'random' scope needs to derive the linkField set from the source query.
       if (spec.sourceDataType && spec.linkField && spec.scope !== 'selected') {
         var sourceQuery = buildQuery({
           dataType: spec.sourceDataType,
