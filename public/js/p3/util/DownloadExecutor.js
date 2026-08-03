@@ -79,6 +79,15 @@ define([
       query = cleanQuery(spec.rqlQuery || '', spec.dataType);
     }
 
+    // Guard: a cross-collection join filter (e.g. genome(...)) as the SOLE top-level clause makes
+    // the data API emit an empty main query (q=()) → Solr "Cannot parse '()'" (HTTP 400). This bites
+    // the all-rows cross-collection prefetch, whose source query from a taxon view is just
+    // "genome(and(eq(taxon_lineage_ids,…),…))". Grids avoid it by prepending a top-level term; do the
+    // same here with a match-all on the primary key so the join has something to attach to.
+    if (/^(?:genome|feature|genome_feature|genome_sequence)\(/.test(query)) {
+      query = 'eq(' + pk + ',*)&' + query;
+    }
+
     // IMPORTANT: The data API requires sort() and limit() clauses for downloads to work.
     // Without these, the server returns Content-Length: 0 (no results).
     // This matches the pattern used in DownloadTooltipDialog.js and other working download code.
