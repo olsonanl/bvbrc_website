@@ -174,6 +174,64 @@ RQL queries are joined with `&` (e.g. `keyword(carsonella)&gt(completion_date,NO
 
 `AdvancedSearch.js` exhibited this bug in its `format*` result-link builders (rendered via `this.viewer.innerHTML`); `GlobalSearch.js` did not (Topic navigate).
 
+### Unified Download Wizard
+
+The `ADV DWNLD` grid action opens `widget/download/UnifiedDownloadWizard.js` — a 3-step wizard (Data
+Type → Records → format-specific Options) that replaces the older DownloadTooltipDialog/AdvancedDownload
+flow. Key modules:
+- `util/DownloadFormats.js` — format registry: `formats`, per-data-type `dataTypeFormats` (pk, sortField,
+  categories, `formatOverrides` for cross-collection routing), and `containerTypeToDataType` mapping.
+- `util/DownloadExecutor.js` — `execute(spec)` runs the download. Sequence/table/accession formats POST a
+  hidden form to `<dataServiceURL>/<dataType>/?http_download=true&http_accept=<mime>` (server-side stream);
+  FASTA adds `http_fasta_*` params. `buildQuery(spec)` builds the RQL (`in(pk,(ids))` for selected scope,
+  else cleaned grid query) plus `sort()` + `limit(2500000)`.
+- Wizard entry: `GridContainer.js` AdvancedDownload action → `QueryDescriptor.createFromGrid(grid,
+  containerType, {selection, primaryKey})` → `UnifiedDownloadWizard.show({queryDescriptor})`.
+
+**Pitfall 1 — cursorMark export requires the Solr uniqueKey in `sort()`.** The `http_download=true`
+path streams via Solr `cursorMark`, which **rejects any sort that doesn't include the collection's
+uniqueKey** (`HTTP 400` → surfaced as `500 "Unable to receive stream: Shard … failed: HTTP 400"`).
+Non-obvious: the genome-family collections have **no `id` field** — their uniqueKey is the domain id
+(`genome`→`genome_id`, `genome_feature`→`feature_id`, `genome_sequence`→`sequence_id`); everything else
+uses `id`. `buildQuery()` builds the sort from `[sortField, pk, DownloadFormats.getUniqueKey(dataType)]`
+(deduped) so the uniqueKey is always present. Any new download data type whose configured
+`sortField`/`pk` in `dataTypeFormats` is not the uniqueKey (e.g. subsystem's `subsystem_id`, pathway's
+`pathway_id`) would 500 without this — and must be added to `getUniqueKey()` if its uniqueKey isn't `id`.
+
+**Pitfall 2 — cross-collection sequence download in *selected* scope must read the linkField off the
+selected rows.** Some formats target a different collection than the source grid (e.g. specialty-genes
+grid, pk `id` UUID → sequence FASTA from `genome_feature` via `linkField: feature_id`). In selected scope
+`selectedIds` defaults to the grid pk, so querying the target with `in(feature_id,(uuids))` matches
+nothing → empty file. This is NOT a missing join: the selected grid **rows already carry the linkField**
+(`sp_gene` rows contain `feature_id`/`patric_id`) — `QueryDescriptor.extractSelectedIds()` was just
+discarding it by keeping only the pk. Fix: `createFromGrid()` retains the row objects as transient
+`selectedRows`, and `_buildDownloadSpec()` remaps `selectedIds` to the rows' `linkField` when
+`linkField !== sourcePrimaryKey` (selected scope), setting `primaryKey = linkField`. No server prefetch.
+When `linkField === pk` (e.g. genome grid → feature accession, both `genome_id`) the remap is skipped and
+the target is queried directly. Selected scope only comes from a live grid (the saved-search download
+path is always 'all' scope), so the rows are always available. General rule: for any cross-collection
+download, read the linking value off the selected row — don't reduce to the grid pk then try to recover it.
+
+**Pitfall 3 — a bare `genome(...)` join as the sole top-level RQL clause makes the data API emit `q=()`
+→ Solr `HTTP 400 "Cannot parse '()'"`.** The API's cross-collection join macro (`genome(...)`,
+`{!join method=crossCollection fromIndex=genome …}`) requires a top-level term to precede it. When
+`genome(...)` is the *only* top-level clause, the join codegen emits an empty main query `q=()` and Solr
+400s. Grids sidestep this by always prepending a term (`keyword(*)` / `eq(feature_id,*)`); the download's
+`cleanQuery()` did not — it only strips a wrapper matching the *target* collection, so a `genome(...)`
+filter on a `sp_gene` source (e.g. a taxon-view Specialty Genes protein-FASTA download, filter
+`genome(and(eq(taxon_lineage_ids,…),ne(genome_status,Deprecated)))`) passed through bare and 400'd.
+**Stopgap fix (client):** `DownloadExecutor.buildQuery` prepends `eq(<pk>,*)&` when the cleaned query
+begins with a bare `genome(`/`feature(`/`genome_feature(`/`genome_sequence(` join (narrow — only fires on
+a leading join wrapper; non-join queries untouched). Verified: `genome(...)` alone → 400,
+`eq(feature_id,*)&genome(...)` → 200. This is a STOPGAP; the proper fix is server-side — the
+cross-collection resolution in `p3_api/PLAN_CROSS_COLLECTION_DOWNLOAD.md` must decompose a source query
+that is itself a `genome(...)` join (run inner subquery → genome_ids → filter source by `in(genome_id,…)`)
+rather than forward it raw (open question #5 there).
+
+Note: the Excel serializer is slow on multi-thousand-row exports (can exceed client timeouts); the
+underlying Solr query/sort is identical to the tsv/csv path, so a slow Excel is a serializer perf issue,
+not a query bug.
+
 ### Visualization Components
 - D3.js for custom visualizations (charts, domain viewers)
 - Cytoscape for network graphs
