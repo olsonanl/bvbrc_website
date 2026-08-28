@@ -22,6 +22,27 @@ un=user@realm|tokenid=UUID|expiry=UNIX_TS|client_id=user@realm|token_type=Bearer
 - Solr `owner`/`user_read`/`user_write` fields = `jsmith@bvbrc`
 - Workspace paths = `/jsmith@bvbrc/home`
 
+### Authorization Header Conventions (three, not one)
+
+The header format is **not uniform today**, and the differences are load-bearing. A survey of `public/js/p3/`, `routes/`, and `lib/` finds ~294 sites setting an `Authorization` header:
+
+| Convention | Count | Sent to | Notes |
+|---|---|---|---|
+| Bare token (`window.App.authorizationToken`) | ~287 | p3_api, p3_user | No scheme prefix at all |
+| `OAuth <token>` | 4 | Workspace service, app service | `WorkspaceManager.js:859,1176`, `UploadManager.js:32` |
+| `Oauth <token>` (lowercase 'a') | 2 | App service stdout/stderr URLs | `JobManager.js:229,240` |
+
+This is not merely cosmetic sloppiness — **p3_api rejects a prefixed token.** `p3_api/middleware/auth.js` passes the raw header value straight into `p3_user/validateToken.js`, which does `token.split('|')` and reconstructs the signed base string from the parts. With an `OAuth ` prefix the first part parses as key `"OAuth un"`, the reconstructed base string no longer matches what was signed, and RSA verification fails. So the bare-token convention is *required* for p3_api and the `OAuth ` convention is *required* for the workspace/app services.
+
+**Implication for the migration:** the plan's original Phase 3 line "update `Authorization` headers from raw token to `Bearer <jwt>`" understates the work by two orders of magnitude. See *Prerequisite: Centralize the Authorization Header* below.
+
+### Token Lifecycle in the Browser (current)
+
+- Token, parsed claims, and user profile live in `localStorage` under `tokenstring`, `auth`, `userProfile`, `userid`, `realm` (`p3app.js:795–801`)
+- `checkLogin()` polls on a timer, parses `auth.expiry`, and refreshes via `GET /authenticate/refresh` — but **only if `window.App.activeMouse || window.App.uploadInProgress`** (`p3app.js:690–730`). An idle user is logged out rather than refreshed.
+- Cross-tab logout is detected by polling for a missing `tokenstring`; a `storage` event listener syncs `userProfile` changes
+- Admin impersonation stashes a second full token under `Aauth`/`Atokenstring`/`AuserProfile`/`Auserid`/`Arealm` (see *Admin Impersonation* below)
+
 ### Services Affected
 | Service | Role | Auth-relevant files |
 |---------|------|-------------------|
@@ -84,6 +105,17 @@ This is **non-negotiable** because `username@realm` is embedded throughout:
 
 Using the same format means **zero changes** to p3_api's `DecorateQuery.js`, `patch.js`, `genomePermissionRouter.js`, or any Solr data.
 
+### Realm Assignment for Social-Login Accounts
+
+**Decision: social-login users get `@bvbrc` identities, same as password users.** There is one BV-BRC identity namespace; the social provider is an *authentication method*, not a separate identity domain. A user who signs in with Google, later links ORCID, and later still sets a BV-BRC password is the same `jsmith@bvbrc` throughout, owns the same workspace, and appears in `user_read`/`user_write` under one name.
+
+Consequences to design for:
+
+- **One username namespace.** A social signup choosing `jsmith` collides with an existing password account `jsmith`. The username-availability check at account creation must consult the same `users` collection used by classic registration — there is no per-realm partition to fall back on.
+- **Do not encode the provider in `sub`.** Formats like `jsmith@google` would fragment the identity across Solr `owner` values and workspace paths, which is exactly what this decision avoids. The provider lives only in `federated_identities`.
+- **Reserved-name handling** applies equally to social signups (same validation rules as current registration: alphanumeric, dot, dash, underscore).
+- **Realm claim.** The `realm` claim stays `bvbrc`. If other realms exist or are added later, `sub` remains `username@realm` and nothing here changes; the point is that federation does not itself create a realm.
+
 ### JWT Claims Structure
 ```json
 {
@@ -123,6 +155,58 @@ Using the same format means **zero changes** to p3_api's `DecorateQuery.js`, `pa
 ### Service-to-Service: Client Credentials
 - Replaces current `POST /authenticate/service` (non-standard app-token + user-token exchange)
 - Services present `client_id`/`client_secret` to get service-scoped JWT
+
+### Admin Impersonation ("SU Login")
+
+This is an existing, in-use feature that the original plan did not address. It must be redesigned, not dropped.
+
+**How it works today:**
+1. Admin clicks "SU Login" (`views/p3header.ejs:275`, `bv-brc-header.ejs:381`), enters their own username/password plus a target username (`widget/SuLogin.js:49`)
+2. `POST /authenticate/sulogin` (`p3_user/routes/authenticate.js:42`) verifies the caller has the `admin` role and re-checks their password with bcrypt, then calls `generateToken(targetUser, 'user')` — returning **a full, ordinary user token for the target**, indistinguishable from one the target would get by logging in
+3. The client stashes the admin's own five `localStorage` keys under `A*` prefixes and swaps in the target's token (`SuLogin.js:58`)
+4. `checkSU()` (`p3app.js:735`) shows a "switch back" affordance when `Aauth.roles` includes `admin`; `suSwitchBack()` (`p3app.js:768`) restores the `A*` keys
+
+**Problems with the current design:**
+- The impersonation token carries **no marker** that it is an impersonation. Every downstream service, log line, and Solr write attributes the action to the target user with no trace of the admin. There is no audit trail.
+- "Am I impersonating?" is decided client-side from `localStorage`. Clearing `Aauth` strands the session as the target with no way back — and, more importantly, the *server* has no idea impersonation is in effect.
+- Two live, fully-privileged tokens sit in `localStorage` simultaneously.
+
+**OIDC design — use Token Exchange with an `act` claim:**
+
+Impersonation is exactly the RFC 8693 impersonation case, and `oidc-provider` already gives us the vocabulary:
+
+```
+POST https://auth.bv-brc.org/token
+grant_type=urn:ietf:params:oauth:grant-type:token-exchange
+subject_token=<target user identity>
+requested_token_type=urn:ietf:params:oauth:token-type:access_token
+actor_token=<admin's own access token>
+actor_token_type=urn:ietf:params:oauth:token-type:access_token
+client_id=bvbrc-web-bff
+client_secret=<secret>
+scope=user
+```
+
+Issued token:
+```json
+{
+  "sub": "targetuser@bvbrc",
+  "act": { "sub": "adminuser@bvbrc" },
+  "scope": "user",
+  "exp": "<short — 30 minutes, not 24 hours>"
+}
+```
+
+Requirements:
+- **The exchange is performed by the website backend (BFF), never the browser.** The `bvbrc-web-bff` client secret stays server-side. This is a second reason to adopt the BFF pattern below.
+- **p3_oidc verifies the actor's `admin` role server-side** at exchange time, from the `users` record — not from a claim the caller supplies.
+- **Re-authentication:** preserve the current password re-prompt. Map it to an OIDC `prompt=login` step or a `max_age` constraint so the admin proves possession recently, rather than re-posting a password to a bespoke endpoint.
+- **Impersonation tokens are short-lived** (30 min, no refresh token). Ending impersonation means discarding the token, not restoring shadow `localStorage` keys.
+- **`act` is honored downstream.** p3_api sets `req.user` from `sub` (so authorization behaves as the target, preserving current semantics) but logs `act.sub` alongside every request. Any write path (`patch.js`, workspace mutations, job submission) records both.
+- **Audit:** every impersonation exchange is logged in p3_oidc (admin, target, timestamp, granted scope) per the AU-2/AU-3 requirements below.
+- **UI:** the existing "switch back" affordance and the `icon-superpowers warning` treatment on the login button should be driven by the presence of `act` in the token, not by `localStorage` shadow keys.
+
+**Phase 6 cleanup:** remove `Aauth`/`Atokenstring`/`AuserProfile`/`Auserid`/`Arealm` handling from `p3app.js` (lines ~768–778, ~925) and `SuLogin.js`, and remove `POST /authenticate/sulogin` from p3_user.
 
 ### Job Submission: Token Exchange (RFC 8693)
 
@@ -208,6 +292,55 @@ Between submission and execution, the one-time ticket sits in Slurm's job metada
 
 ---
 
+## Token Storage: Adopt the BFF Pattern
+
+The original plan proposed "short-lived access tokens in memory/localStorage, refresh tokens with sliding window (30 days) and absolute max (90 days)." **Refresh tokens must not go in `localStorage`.**
+
+**The risk.** Today an XSS on the site steals a 24-hour token. Under the naive plan it would steal a refresh token good for 30–90 days, silently renewable, surviving password changes unless explicitly revoked. That is a strict regression in blast radius, and it lands on a large legacy Dojo codebase with a great deal of `innerHTML` construction — see the RQL/HTML-entity class of bug already documented in `CLAUDE.md`. Assuming no XSS is not a safe premise here.
+
+**The design.** The website backend becomes a Backend-For-Frontend confidential client:
+
+- The browser never sees a refresh token. `/callback` (already planned) exchanges the code and stores the refresh token **server-side**, keyed by a session cookie: `httpOnly`, `Secure`, `SameSite=Lax`, host-scoped.
+- The browser holds only a short-lived access token (15–30 min) **in memory** (`window.App.authorizationToken`, which already exists), not in `localStorage`.
+- On access-token expiry the client calls `POST /auth/refresh` on the *website's own origin*; the BFF uses its stored refresh token to mint a new access token and returns it in the response body. Refresh-token rotation and reuse detection happen entirely server-side.
+- Optionally the BFF can proxy API calls entirely, so no token reaches JS at all. That is the stronger posture but a much larger change to ~294 call sites; the in-memory-access-token variant is the pragmatic middle and can be tightened later.
+
+**What this changes about existing behavior:**
+
+- **Page reload no longer has a token in `localStorage` to resume from.** On load, the client calls `/auth/refresh` once; the session cookie silently re-establishes the access token. This is a behavior change in `checkLogin()` and needs care so a hard refresh does not flash the logged-out UI.
+- **Cross-tab sync.** Current logic polls `localStorage.tokenstring` and watches `storage` events. With an in-memory token each tab holds its own; logout must be broadcast — either a `BroadcastChannel`, or keep a *non-sensitive* `localStorage` flag (e.g. `loggedIn: true/false`) purely as a cross-tab signal while the token itself stays in memory.
+- **The idle-logout quirk should be revisited.** `checkLogin()` only refreshes when `activeMouse || uploadInProgress`, so an idle user is logged out even though the refresh would have succeeded. With server-side refresh tokens the natural model is: refresh on demand when an API call needs it, and let the refresh token's own sliding/absolute window define the session lifetime. Decide this deliberately rather than porting the mouse-activity heuristic.
+- **`userProfile` in `localStorage`** is not a credential and can stay, but should be treated as a cache, re-validated from the ID token / `/userinfo`.
+
+If the BFF is judged too large for Phase 3, the fallback is: access token in memory, refresh token in an `httpOnly` cookie scoped to a single refresh endpoint, with rotation and reuse detection enabled. What is *not* acceptable is a long-lived refresh token readable by JavaScript.
+
+---
+
+## Prerequisite: Centralize the Authorization Header
+
+**This should happen before Phase 3, and can land independently of the whole migration.**
+
+As surveyed above, ~294 sites build `Authorization` headers inline, in three mutually incompatible conventions, with the correct convention depending on which service is being called. Changing the token format means touching every one of them — unless they are first funnelled through a single helper.
+
+Proposed refactor (mechanical, no behavior change, ships on its own branch):
+
+```javascript
+// public/js/p3/auth/authHeaders.js
+// scheme: 'api' (bare, for p3_api/p3_user) | 'oauth' (workspace/app service)
+function authHeader(scheme) { ... }
+```
+
+- Replace `Authorization: (window.App.authorizationToken || '')` with `authHeader('api')`
+- Replace `'OAuth ' + window.App.authorizationToken` / `'Oauth ' + ...` with `authHeader('oauth')`
+- `WorkflowManager.js:22` already has a local `getAuthHeader()` — fold it in
+- `jsonrpc.js:11` and `SEEDClient.js:137` take the token as a parameter; route those through the helper too
+
+Once this exists, the Phase 3 change is: `authHeader()` returns `'Bearer ' + jwt`, in one file. Without it, Phase 3 is a 294-site edit with a per-site correctness question, done at the same time as everything else is changing.
+
+**Server-side counterpart:** the workspace and app services must accept `Bearer` in addition to `OAuth`. Verify this before flipping the client, or the two conventions diverge in the wrong direction.
+
+---
+
 ## Third-Party Provider Integration
 
 Third-party providers are **upstream IdPs in p3_oidc**, not integrated directly into the website:
@@ -258,6 +391,24 @@ Indexes: `{ provider, provider_sub }` (unique), `{ bvbrc_user_id, provider }`
    - **If existing account is passwordless** (social-only): send a verification code to the email on file, require the user to enter it to prove ownership
    - **Email match alone is never sufficient to auto-link** — this prevents an attacker from creating a social account with a victim's email and hijacking their BV-BRC account
 
+### "Verified Email" Must Be Enforced, Not Assumed
+
+The collision logic above says "provider's verified email" — that qualifier has to be mechanically enforced, because the providers differ:
+
+- **Google:** returns `email_verified` in the ID token. Require it to be `true`. Also require `hd` handling to be deliberate if institutional domains matter later.
+- **GitHub:** a user may have multiple emails, some unverified, and may hide their email entirely (returning a `@users.noreply.github.com` address). Query the `/user/emails` API and use **only** an address marked both `primary` and `verified`. If none exists, treat it as "no email" and fall through to the no-collision path (user picks a username, no linking).
+- **ORCID:** email is often not released at all — ORCID users frequently keep email private. The ORCID iD itself is the stable identifier; do not assume an email is present.
+
+Hard rules:
+- An email that is absent, or present but not asserted-verified by the provider, **never** participates in collision detection and **never** triggers a link prompt.
+- Never trust an email supplied in a form field over one asserted by the provider.
+- The `{ provider, provider_sub }` pair — not email — is the unique key for `federated_identities`, as the schema already specifies. Email is a *hint* for the linking UX only.
+- Providers that cannot assert email verification are still usable for login; they simply always take the "no collision" path.
+
+### Unlink Guard — Lockout Prevention
+
+The plan already notes the passwordless-single-provider guard. Make it a server-side invariant, not a UI check: **reject any unlink request that would leave an account with zero usable authentication methods** (no password AND no remaining linked provider). Enforce this in the p3_oidc/p3_user API, since the UI can be bypassed.
+
 **Linking from account settings (already logged in):** User goes to account settings, clicks "Link Google/ORCID/GitHub account," completes the social provider's OAuth flow, creates the `federated_identities` record.
 
 **Account settings UI for linked accounts:** The user profile/settings page includes a "Linked Accounts" section showing:
@@ -293,18 +444,50 @@ Indexes: `{ provider, provider_sub }` (unique), `{ bvbrc_user_id, provider }`
 
 ## Dual-Token Validation in p3_api
 
-During transition, `p3_api/middleware/auth.js` accepts both formats:
+During transition, `p3_api/middleware/auth.js` accepts both formats.
 
-- **Legacy tokens** contain `|` characters
-- **JWTs** contain exactly two `.` characters (header.payload.signature)
+**Step 0 — normalize the scheme prefix, before any format sniffing.** Today `auth.js` passes `req.headers['authorization']` verbatim into `ValidateToken`, which immediately does `token.split('|')`. That works only because p3_api's callers send a bare token; an `OAuth `-prefixed token fails signature verification (the prefix corrupts the reconstructed base string). The new middleware must strip a leading `Bearer `, `OAuth `, or `Oauth ` (case-insensitive scheme match) and then dispatch:
 
-Both paths set `req.user = "username@realm"` — downstream middleware (`DecorateQuery.js`, `patch.js`, etc.) is unchanged.
+```
+raw = req.headers['authorization']
+token = raw.replace(/^\s*(Bearer|OAuth)\s+/i, '').trim()
+if token contains '|'        -> legacy path (existing ValidateToken)
+else if token matches JWT    -> JWKS path
+else                         -> reject
+```
 
-JWT verification uses JWKS from `https://auth.bv-brc.org/.well-known/openid-configuration` with TTL-based caching (similar to existing `ssCache` for legacy public key).
+Sniff the JWT case with a real shape test (`/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/`), not a count of `.` characters — a malformed legacy token without `|` should be rejected outright, not handed to the JWT verifier.
+
+Both paths set `req.user = "username@realm"` — downstream middleware (`DecorateQuery.js:10`, `patch.js`, etc.) is unchanged. Keep setting `req.authUser` as well; both are populated today.
+
+JWT verification uses JWKS from `https://auth.bv-brc.org/.well-known/openid-configuration` with TTL-based caching (similar to the existing `ssCache` for the legacy public key).
+
+**Operational details worth specifying now:**
+
+- **Clock skew.** `jose` defaults to zero tolerance on `exp`/`nbf`/`iat`. Set an explicit tolerance (e.g. `clockTolerance: '30s'`); otherwise NTP drift between colo hosts produces intermittent, hard-to-diagnose 401s.
+- **JWKS fetch failure must not empty the cache.** The existing `ssCache` caches on success and simply refetches on miss; a JWKS cache with a TTL has a failure mode `ssCache` does not — if the refresh fetch fails at TTL expiry and the code clears the entry, *every* request 401s until the provider returns. Serve the stale key set on fetch failure and only hard-fail after an extended grace period. Log loudly when serving stale.
+- **Single-flight the JWKS refresh** so a burst of requests at TTL expiry does not stampede p3_oidc.
+- **Validate `iss` and `aud` explicitly.** Signature-valid is not sufficient; pin the issuer to the configured `https://auth.bv-brc.org` and require `aud` to include `bvbrc-api`. This is the JWT analogue of the `SigningSubject` check already in `validateToken.js` — which, per its own comment, was fail-closed only by accident at one point. Do not repeat that.
+- **Fail closed on unknown `kid`.** Refetch JWKS once (rate-limited), then reject.
+- **Metrics for Phase 6.** Count legacy vs. JWT validations, labeled by caller where possible. Phase 6's "monitor usage, remove when safe" needs this data to exist from Phase 2 onward — add it now, not later.
+
+### Roles and Revocation Latency
+
+`sulogin` gates on `user.roles.indexOf('admin')` read from MongoDB, and the client reads `auth.roles` from the parsed token for UI decisions (`p3app.js:742`). Once roles ride in the JWT, **role changes do not take effect until the access token expires.** For group membership the plan already accepts this tradeoff; for `admin` it deserves a decision rather than an inheritance:
+
+- Short access tokens (15–30 min) bound the window, which is probably acceptable for role *grants*
+- For role *revocation* — de-admining someone — 30 minutes of residual privilege may not be. Options: keep authoritative role checks server-side at the point of privileged action (p3_oidc re-reads the `users` record on impersonation exchange regardless, as specified above), or add token introspection for privileged endpoints only.
+- **Client-side `roles` is UI-only.** It already is today, but state it explicitly so the JWT version is not mistaken for an authorization decision. Every privileged operation re-checks server-side.
 
 ---
 
 ## Phased Migration
+
+### Phase 0: Centralize the Authorization header (prerequisite)
+- Introduce `public/js/p3/auth/authHeaders.js`; convert all ~294 inline `Authorization` sites to it, preserving the existing per-service scheme (bare for p3_api/p3_user, `OAuth ` for workspace/app service)
+- Fold in `WorkflowManager.js`'s local `getAuthHeader()`, plus the token-parameter cases in `jsonrpc.js` and `SEEDClient.js`
+- Confirm workspace and app services accept `Bearer` as well as `OAuth`
+- **Delivers:** no behavior change, but Phase 3 becomes a one-file edit instead of a 294-site edit. Ships independently on its own branch, reviewable in isolation.
 
 ### Phase 1: Deploy p3_oidc (Foundation)
 - Create `p3_oidc` service with `oidc-provider`, MongoDB adapter, `findAccount` reading existing `users` collection
@@ -314,24 +497,122 @@ JWT verification uses JWKS from `https://auth.bv-brc.org/.well-known/openid-conf
 - **Delivers:** Running OIDC provider, no user-facing changes, no risk to existing services
 
 ### Phase 2: Dual-token validation in p3_api
-- Update `p3_api/middleware/auth.js` to detect and validate JWTs via JWKS
+- Update `p3_api/middleware/auth.js`: strip scheme prefix, detect format, validate JWTs via JWKS
 - Add `jose` library dependency
+- Add legacy-vs-JWT validation metrics (needed for the Phase 6 decision)
+- Implement stale-on-failure JWKS caching, single-flight refresh, explicit `iss`/`aud` checks, clock tolerance
 - **Delivers:** API accepts JWTs — any client can start using them while legacy tokens still work
-- **Critical test:** `req.user` is identical for same user regardless of token format
+- **Critical test:** `req.user` is identical for the same user regardless of token format
+- **Also test:** prefixed and unprefixed legacy tokens both validate; a garbage token with neither `|` nor JWT shape is rejected; JWKS unavailability does not 401 valid legacy tokens
+
+**Gate:** Phase 3 does not ship until Phase 2 is deployed *in production* and verified with synthetic JWTs. If the website begins issuing JWTs before every p3_api instance accepts them, in-flight users break. Verify across all API instances behind the load balancer, not just one.
 
 ### Phase 3: Website OIDC login
-- Add `/callback` route to website backend for code exchange
-- Update `LoginForm.js` — redirect-based OIDC flow with social login buttons
-- Update `p3app.js` — JWT-aware `login()`, `checkLogin()`, token refresh via `grant_type=refresh_token`
-- Update `Authorization` headers from raw token to `Bearer <jwt>`
-- Add "Linked Accounts" section to `UserProfileForm.js` — view/link/unlink social providers
-- **Delivers:** Users can log in via OIDC including Google/ORCID/GitHub, and manage their linked accounts
 
-### Phase 4: CLI Device Authorization
+Split into three independently shippable sub-phases.
+
+**Phase 3a — BFF + OIDC login with BV-BRC credentials only**
+- Add `/callback` route to website backend for code exchange
+- Implement the BFF session layer: server-side refresh token storage, session cookie, `POST /auth/refresh`, `POST /auth/logout`
+- Update `LoginForm.js` — redirect-based OIDC flow (no social buttons yet)
+- Update `p3app.js` — JWT-aware `login()`/`checkLogin()`; in-memory access token; cross-tab logout signal replacing `localStorage` token polling; resolve the idle-refresh (`activeMouse`) question
+- Flip `authHeaders.js` to emit `Bearer <jwt>` (one file, thanks to Phase 0)
+- **Delivers:** existing users log in through OIDC with no visible change in available login methods. The riskiest infrastructure lands with the smallest surface of new user-facing behavior, and is independently revertable.
+
+**Phase 3b — Social providers and linked accounts**
+- Configure Google, ORCID, GitHub as upstream IdPs in p3_oidc
+- First-time-login account creation flow (username choice, availability check against the shared namespace)
+- Email-collision linking flow with per-provider verified-email enforcement
+- Add "Linked Accounts" section to `UserProfileForm.js` — view/link/unlink, with the lockout guard enforced server-side
+- **Delivers:** third-party login and account linking
+
+**Phase 3c — SU Login redesign**
+- Impersonation via Token Exchange with `act` claim; server-side admin verification; short-lived, non-refreshable token
+- p3_api logs `act.sub` alongside `sub`
+- Drive the switch-back UI from the `act` claim rather than `A*` localStorage keys
+- **Delivers:** admin impersonation with a real audit trail
+- **Depends on:** 3a (needs the BFF to hold the exchange client secret)
+
+### Phase 4: CLI Device Authorization and the Perl Stack
+
+This is the second-largest phase and the one with the most code outside this repository. The original one-line description ("Update Perl `P3AuthToken` module to handle JWT format") understated it substantially. An inventory of `app_service/` follows; **it is partial** — `P3AuthToken.pm` and `P3TokenValidator.pm` themselves live in another repo (likely `p3_core`/`dev_container` modules) and are not checked out here, and the Perl CLI distribution (`p3-*` commands) is a separate repo that has not been surveyed. Complete the inventory across those before committing to an estimate.
+
+#### 4a. Inventory findings (app_service only)
+
+**The good news: there is a real abstraction, and most code uses it.** 14 files `use P3AuthToken`, and the accessor surface actually exercised is small:
+
+| Accessor | Uses | Notes |
+|---|---|---|
+| `->user_id` | 9 | The dominant use. Maps to JWT `sub`. |
+| `->token` | 7 | Raw token string, for forwarding in headers / storing |
+| `->expiry` | 3 | Unix epoch. Maps to JWT `exp`. |
+| `->is_admin` | 2 | Maps to a `roles` claim — but see the hardcoded-username bug below |
+
+Constructor forms in use: `P3AuthToken->new()`, `->new(token => $t)`, `->new(token => $t, ignore_authrc => 1)`, `->new(ignore_authrc => $ENV{KB_INTERACTIVE} ? 0 : 1)`.
+
+**This means a compatibility shim is viable and should be the primary strategy.** If `P3AuthToken` learns to detect a JWT, verify it via JWKS, and populate `user_id`/`expiry`/`is_admin` from claims, the great majority of the 14 consumers need no change at all. Budget the work as "one module done properly" plus the exceptions below — not "rewrite the Perl stack."
+
+**The bad news: four sites bypass the abstraction and parse the raw string.** These break silently on a JWT (the regex simply fails to match, yielding `undef` rather than an error):
+
+1. `lib/Bio/KBase/AppService/Util.pm:426` — `my($user_id) = $token =~ /\bun=([^|]+)/;` inside `token_user_is_admin`
+2. `lib/Bio/KBase/AppService/Quick.pm:132` — same regex, sets `vars->{user}` and `$ENV{KB_AUTH_TOKEN}`
+3. `lib/Bio/KBase/AppService/AppServiceImpl.pm:164` — `sed -e '/un=/s/sig=[a-z0-9]*/sig=XXX/'` used to **redact the signature from logged tokens**. On a JWT this pattern matches nothing, so *tokens would be written to logs unredacted*. This is a security regression if missed — fix it in the same commit that enables JWTs, not later.
+4. `lib/Bio/KBase/AppService/SlurmCluster.pm:1023` — `split(/\|/)`; confirm whether this is token parsing or unrelated field splitting before touching it.
+
+**Bug found during inventory — `token_user_is_admin` is not an admin check.** `Util.pm:418–428` reads:
+```perl
+my($user_id) = $token =~ /\bun=([^|]+)/;
+return $user_id eq 'olson@patricbrc.org';
+```
+The comment says "Let admins (Bob for now) submit when the service is down." It hardcodes a single username, ignores the token's `roles` field entirely, and — because it never validates the signature — **trusts an unverified string**. Anyone who can present a token-shaped string containing `un=olson@patricbrc.org` passes this check. Callers are `Util.pm:334` and `Util.pm:372`. This should be fixed on its own, independently of and **before** the OAuth2 work, and the fix should be a real roles check against a validated token. Do not port this logic forward.
+
+#### 4b. Job token plumbing (interacts with the Token Exchange design)
+
+The Phase-3 Token Exchange design for jobs lands directly on this code, so the two must be planned together:
+
+- **`TaskToken` table** (`Schema/Result/TaskToken.pm`) stores `task_id`, `token` (TEXT), `expiration` (TIMESTAMP). This is the "bearer token at rest in the scheduler DB" the plan proposes to eliminate — replaced by the one-time ticket. Written at `Scheduler.pm:333`, `Schema.pm:65`, `SchedulerDB.pm:220`; read at `SlurmCluster.pm:822` (`order_by expiration DESC`, single row).
+- **`expiration` is derived from `$token->expiry`** (`Scheduler.pm:336`, `Schema.pm:68`, `SchedulerDB.pm:222`). Under the ticket model this column changes meaning — it becomes the ticket's validity window, not the token's.
+- **`slurm_batch.tt:71-72`** exports the token into the job environment:
+  ```
+  export P3_AUTH_TOKEN="[% task.token %]"
+  export KB_AUTH_TOKEN="[% task.token %]"
+  ```
+  This is where the ticket-redemption step is inserted. **Note there are two environment variables, not one** — both are consumed downstream (`p3x-submit-job.pl:179` sets both explicitly). Any change must set both, or find and update every reader.
+- **Schema migration:** replacing `token` with `ticket_hash` is a DB migration on a live scheduler with in-flight jobs. Plan for a period where both columns exist: new jobs get tickets, already-queued jobs still redeem their stored token. Do not migrate in place and strand queued work.
+- `p3x-archive-tasks.pl:399` deletes `TaskToken` rows on archive; `p3x-resubmit-load-files.pl:50` joins against them. Both need review under the new schema.
+
+#### 4c. Perl HTTP clients send `OAuth`, and must learn `Bearer`
+
+Mirroring the JavaScript situation, four Perl sites hardcode the `OAuth` scheme:
+- `Shock.pm:23`, `Awe.pm:175` (which *also* sends a non-standard `Datatoken` header carrying the same token), `Quick.pm:266`, `AppScript.pm:325`
+
+These need the same centralization treatment as Phase 0 does for the browser: one helper that emits the right scheme, so the JWT flip is a single edit. `Awe.pm`'s `Datatoken` header needs a decision — retain, or drop if AWE is no longer in the path.
+
+#### 4d. Validation path
+
+`P3TokenValidator` is used in 3 files (`AsyncService.pm:28,199,239`, `AppServiceImpl.pm:94,289`, `Quick.pm:25,77`). It is the Perl analogue of `p3_api/middleware/auth.js` and needs the same dual-token treatment: scheme-prefix stripping, format detection, JWKS verification with caching, explicit `iss`/`aud` checks, and clock tolerance. Because it is already a discrete class with a `validate()` method returning `($ok, $msg)`, this is a contained change — the interface does not move.
+
+Also present: two scripts use the older `Bio::KBase::AuthToken` instead of `P3AuthToken` (`scripts/codon-tree-stats.pl:6`, `service-scripts/gather-stats.pl:5`). Determine whether these are live or dead before deciding to update them.
+
+#### 4e. The CLI login command itself
+
 - Enable Device Authorization Grant in p3_oidc
-- Create `bvbrc-login` CLI command for device flow
-- Update Perl `P3AuthToken` module to handle JWT format
-- **Delivers:** CLI users authenticate via browser, no passwords in terminal
+- Create the `bvbrc-login` CLI command: `POST /device/authorize`, display `user_code` + `verification_uri`, poll `/token` respecting the `interval` and `slow_down` responses per RFC 8628
+- **Token storage on disk.** Current behavior is governed by `ignore_authrc` and an `.authrc`-style file; `Quick.pm:43` explicitly deletes `$ENV{KB_AUTH_TOKEN}`. Decide where the JWT and its refresh token live (`~/.bvbrc/auth_token` is proposed) and set permissions to `600`. A refresh token on disk is long-lived — this is the CLI's equivalent of the browser refresh-token question and deserves the same scrutiny.
+- **Refresh on the CLI.** Unlike the browser there is no BFF. The CLI is a public client, so it gets a rotating refresh token stored locally; ensure rotation and reuse-detection are enabled so a stolen file is detectable.
+- **Non-interactive/service use.** `ignore_authrc => 1` and `KB_INTERACTIVE` indicate there are non-interactive callers that cannot complete a device flow. These need a different path — Client Credentials (Phase 5) or a long-lived, explicitly-provisioned credential. **Enumerate these before Phase 6 removes the legacy path**, or scripted/cron users break with no migration route.
+
+#### 4f. Sequencing
+
+1. Fix `token_user_is_admin` (independent, do now)
+2. Fix the `sed` signature-redaction so it handles both formats (do with, or before, JWT enablement)
+3. Centralize Perl `Authorization` header construction (analogue of Phase 0)
+4. Teach `P3AuthToken` and `P3TokenValidator` dual-format handling
+5. Convert the four raw-regex sites to use the accessor
+6. `bvbrc-login` device flow command
+7. Job-token/ticket plumbing — coordinate with Phase 3's Token Exchange work
+
+- **Delivers:** CLI users authenticate via browser, no passwords in terminal; Perl services accept JWTs
 
 ### Phase 5: Service-to-service migration
 - Register service clients, migrate workspace/app services to Client Credentials
@@ -349,9 +630,14 @@ JWT verification uses JWKS from `https://auth.bv-brc.org/.well-known/openid-conf
 
 - **PKCE mandatory** for all Authorization Code flows (S256 only)
 - **Refresh token rotation** — each refresh yields new token; old one invalidated; reuse triggers grant revocation
-- **Token storage** — short-lived access tokens (15-30 min) in memory/localStorage, refresh tokens with sliding window (30 days) and absolute max (90 days)
+- **Token storage** — short-lived access tokens (15-30 min) **in memory only**; refresh tokens held server-side by the BFF behind an `httpOnly`/`Secure`/`SameSite=Lax` session cookie, with sliding window (30 days) and absolute max (90 days). **Refresh tokens are never readable by JavaScript.** See *Token Storage: Adopt the BFF Pattern* above for rationale and the fallback option.
 - **RSA-SHA1 → RS256** — significant cryptographic upgrade (also addresses FIPS 140-2/SC-13 — SHA-1 is deprecated for digital signatures under NIST SP 800-131A)
 - **Rate limiting** on `/token` and `/device/authorize` endpoints
+- **Device flow: rate-limit the verification page too.** The plan rate-limits `/device/authorize` (code issuance) but the brute-force target is the *user-facing* `/device` page where a `user_code` is entered. Require adequate `user_code` entropy, rate-limit attempts per session/IP, and invalidate a `device_code` after a small number of failed `user_code` entries.
+- **Redirect URI allowlisting** — exact-match only, no wildcards, no scheme-relative values. Register the precise `/callback` URLs for each deployment (prod, alpha, dev).
+- **`state` parameter** in addition to PKCE, for CSRF protection on the callback.
+- **Open-redirect review on `/callback`** — any post-login `returnTo` must be validated against a same-origin allowlist, not reflected.
+- **Content Security Policy.** With access tokens in JS memory, CSP is the primary XSS mitigation. Worth an assessment during Phase 3 even if a strict policy is a longer project for a Dojo codebase.
 
 ---
 
@@ -482,6 +768,9 @@ Log the following events:
 - Client secret creation and rotation
 - Failed authentication attempts to p3_oidc
 - Token Exchange requests (which service requested delegation for which user)
+- **Admin impersonation** — every SU Login exchange: admin identity, target identity, timestamp, scope, and the resulting token's `tokenid`. Also log the *end* of an impersonation session where observable. This capability produces no audit trail today; the migration is the opportunity to fix that.
+- **Requests made under impersonation** — p3_api logs `act.sub` alongside `sub` for any request whose token carries an `act` claim, so a write attributed to a user can be traced to the admin who performed it
+- Account linking and unlinking (user, provider, provider_sub, timestamp)
 - Administrative actions (client registration changes, user role modifications)
 
 ---
@@ -533,24 +822,72 @@ Groups are resolved at login time and cached in the token. With short-lived acce
 
 ## Files Requiring Changes (by phase)
 
+### Phase 0 (prerequisite, ships independently)
+- `bvbrc_website/public/js/p3/auth/authHeaders.js` — **new**, single source of auth headers
+- ~294 call sites across `public/js/p3/` — mechanical conversion. Concentrations: `GridContainer.js` (9), `PathwayMapKegg.js` (6), `SubSystemsOverviewMemoryGrid.js` (4), `UserProfileForm.js` (4), `IDMappingAppResultGridContainer.js` (3), `GroupExplore.js` (3), `SubsystemServiceMemoryGridContainer.js` (3), `p3app.js` (4), `WorkspaceManager.js` (2), `JobManager.js` (2)
+- `public/js/p3/WorkflowManager.js` — remove local `getAuthHeader()` in favor of the shared one
+- `public/js/p3/jsonrpc.js`, `public/js/p3/widget/SEEDClient.js`, `public/js/p3/UploadManager.js` — token-parameter cases
+
 ### Phase 1 (new service, no existing file changes)
 - New repo: `p3_oidc/` with `oidc-provider` configuration, MongoDB adapter, `findAccount` adapter
 
 ### Phase 2
-- `p3_api/middleware/auth.js` — dual-token detection and JWT validation
+- `p3_api/middleware/auth.js` — scheme-prefix stripping, dual-token detection, JWT validation, metrics
 - `p3_api/package.json` — add `jose` dependency
 
 ### Phase 3
-- `bvbrc_website/routes/` — new `callback.js` route
-- `bvbrc_website/app.js` — mount callback route
+- `bvbrc_website/routes/` — new `callback.js` route; new `auth.js` route (`/auth/refresh`, `/auth/logout`)
+- `bvbrc_website/app.js` — mount callback/auth routes, session middleware
+- `bvbrc_website/lib/` — BFF session + refresh-token store
 - `bvbrc_website/public/js/p3/widget/LoginForm.js` — OIDC redirect flow
-- `bvbrc_website/public/js/p3/app/p3app.js` — JWT-aware auth lifecycle
-- `bvbrc_website/public/js/p3/WorkspaceManager.js` — `Bearer` prefix
+- `bvbrc_website/public/js/p3/app/p3app.js` — JWT-aware auth lifecycle; in-memory token; `checkLogin()`/`timeout()`/`checkSU()` rework; cross-tab logout signal
+- `bvbrc_website/public/js/p3/auth/authHeaders.js` — switch to `Bearer` (single edit)
+- `bvbrc_website/public/js/p3/widget/SuLogin.js` — Token Exchange flow, drop `A*` localStorage shadow keys
+- `bvbrc_website/public/js/p3/widget/UserProfileForm.js` — Linked Accounts section
+- `p3_oidc` — impersonation Token Exchange with server-side admin check
 
 ### Phase 4
-- CLI tools (separate repo) — device flow command
-- Perl modules — JWT parsing
+
+*Core auth modules (repo not checked out locally — locate before estimating):*
+- `P3AuthToken.pm` — dual-format detection; populate `user_id`/`expiry`/`is_admin` from JWT claims. **The compatibility shim that makes most of the rest a no-op.**
+- `P3TokenValidator.pm` — scheme stripping, format detection, JWKS verification, `iss`/`aud` checks, clock tolerance
+
+*Raw-regex parse sites that bypass the abstraction (`app_service/`):*
+- `lib/Bio/KBase/AppService/Util.pm:426` — `un=` regex in `token_user_is_admin` (**also fix the hardcoded-username bug, separately and first**)
+- `lib/Bio/KBase/AppService/Quick.pm:132` — `un=` regex
+- `lib/Bio/KBase/AppService/AppServiceImpl.pm:164` — `sed` signature redaction; **silently stops redacting on JWTs**
+- `lib/Bio/KBase/AppService/SlurmCluster.pm:1023` — `split(/\|/)`; confirm whether token-related
+
+*`OAuth` → `Bearer` header sites (`app_service/`):*
+- `lib/Bio/KBase/AppService/Shock.pm:23`, `Awe.pm:175` (plus non-standard `Datatoken` header), `Quick.pm:266`, `AppScript.pm:325`
+
+*Job token plumbing (coordinate with Phase 3 Token Exchange):*
+- `lib/Bio/KBase/AppService/Schema/Result/TaskToken.pm` — schema change, `token` → `ticket_hash`
+- `lib/Bio/KBase/AppService/Scheduler.pm:333`, `Schema.pm:65`, `SchedulerDB.pm:220` — writers
+- `lib/Bio/KBase/AppService/SlurmCluster.pm:822` — reader
+- `lib/Bio/KBase/AppService/slurm_batch.tt:71-72` — ticket redemption; sets **both** `P3_AUTH_TOKEN` and `KB_AUTH_TOKEN`
+- `service-scripts/p3x-archive-tasks.pl:399`, `p3x-resubmit-load-files.pl:50` — review under new schema
+
+*CLI (separate repo, not surveyed):*
+- `bvbrc-login` device flow command; on-disk token/refresh-token storage at `600`
 
 ### Phase 6
-- `p3_user/routes/authenticate.js` — remove or redirect legacy endpoints
+- `p3_user/routes/authenticate.js` — remove or redirect legacy endpoints, including `POST /authenticate/sulogin` (line 42)
 - `p3_api/middleware/auth.js` — remove legacy validation path
+- `bvbrc_website/public/js/p3/app/p3app.js` — remove residual `A*` localStorage handling (~768–778, ~925)
+- Perl: remove legacy branch from `P3AuthToken`/`P3TokenValidator`; drop `OAuth` scheme fallback
+
+---
+
+## Open Questions
+
+1. **BFF scope** — full API proxy (no token in JS at all) or in-memory access token with server-side refresh? The latter is proposed above as the pragmatic choice; confirm.
+2. **Idle session policy** — preserve today's "logged out unless mouse active" behavior, or move to refresh-token-window semantics? These give noticeably different UX for long-running analysis sessions.
+3. **Impersonation re-auth** — is `prompt=login` acceptable to admins, or is the current password re-prompt preferred for familiarity?
+4. **Where do `P3AuthToken.pm` and `P3TokenValidator.pm` live?** Neither is in the local checkouts. They are the load-bearing modules for Phase 4 and must be located and read before that phase can be estimated.
+5. **Perl CLI repo inventory** — the `p3-*` command distribution has not been surveyed at all. Run the same `un=` / `SigningSubject` / `tokenid` / `split(/\|/)` / `P3AuthToken` grep there.
+6. **Non-interactive Perl callers** — `ignore_authrc => 1` and `KB_INTERACTIVE` imply scripted users who cannot complete a device flow. Enumerate them and decide their migration path (Client Credentials? provisioned credential?) before Phase 6 removes legacy tokens.
+7. **`Awe.pm`'s `Datatoken` header** — is AWE still in the request path? If yes, does it need the JWT too; if no, delete.
+8. **`TaskToken` migration strategy** — confirm the dual-column approach for in-flight jobs is acceptable to operations, and who owns the schema change.
+9. **Workspace/app service `Bearer` support** — does it exist already, or is it work? Blocks Phase 0's server-side counterpart.
+10. **Are there non-browser, non-CLI legacy token consumers** (external collaborators, cron jobs) that would need notice before Phase 6? The Phase 2 metrics should answer this empirically.
