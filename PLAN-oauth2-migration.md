@@ -535,7 +535,32 @@ Split into three independently shippable sub-phases.
 
 ### Phase 4: CLI Device Authorization and the Perl Stack
 
-This is the second-largest phase and the one with the most code outside this repository. The original one-line description ("Update Perl `P3AuthToken` module to handle JWT format") understated it substantially. An inventory of `app_service/` follows; **it is partial** — `P3AuthToken.pm` and `P3TokenValidator.pm` themselves live in another repo (likely `p3_core`/`dev_container` modules) and are not checked out here, and the Perl CLI distribution (`p3-*` commands) is a separate repo that has not been surveyed. Complete the inventory across those before committing to an estimate.
+This is the second-largest phase and the one with the most code outside this repository. The original one-line description ("Update Perl `P3AuthToken` module to handle JWT format") understated it substantially. An inventory of `app_service/` follows; **it is partial** — the Perl CLI distribution (`p3-*` commands) is a separate repo that has not been surveyed. Complete that inventory before committing to an estimate.
+
+#### 4a-0. The auth modules: `p3_auth` (located)
+
+`P3AuthToken.pm` and `P3TokenValidator.pm` live in **`git@github.com:olsonanl/p3_auth`**, vendored as `dev_container/modules/p3_auth/lib/`. Both are small, and the shim strategy below is confirmed viable by reading them.
+
+**`P3AuthToken.pm` (209 lines).** Every accessor is a regex over the raw `$self->{token}` string — there is no parse step to hook:
+
+| Method | Implementation | JWT equivalent |
+|---|---|---|
+| `is_token($str)` | `return 0 unless $str =~ /\bun=/`, then checks `expiry=` | Must learn JWT shape, else a JWT is silently "not a token" |
+| `user_id` | `/\bun=([^\|]+)/` | `sub` claim |
+| `expiry` | `/\bexpiry=(\d+)/` | `exp` claim |
+| `is_admin` | `/\|scope=user\|/ && /\|roles=admin\|/` | `roles` claim — **client-side/UI only, never an authorization decision** |
+| `signature` | `/\bsig=([^\|]+)/` | No equivalent; audit callers |
+
+**`is_token()` is the highest-risk method.** It gates both `initialize_token_from_environment` (reading `P3_AUTH_TOKEN`/`KB_AUTH_TOKEN`) and `initialize_token_from_files` (reading `~/.patric_token`). A JWT in either location is rejected as "not a token" and the constructor returns an object with an undef token — **no error, no warning**. Teaching `is_token` the JWT shape is the first change in this module, not an afterthought.
+
+Note also that `is_token` and `expiry` do a *local, unverified* expiry check by regex. The JWT path must not simply trust `exp` from an unverified payload for anything security-relevant — local expiry checking is a UX affordance ("your token is stale, log in again"), and the authoritative check stays in `P3TokenValidator`.
+
+**`P3TokenValidator.pm` (108 lines).** A discrete class: `validate()` returns `($ok, $msg)`, so the interface does not move — this is the contained change the plan assumed. It caches pubkeys per signer URL for 86400s and calls `$pubkey->use_sha1_hash()`. Two things to carry into the JWT path:
+
+- The pubkey cache has **no stale-on-failure behavior** — on a fetch failure it returns `undef` and every validation fails until the signer recovers. This is the same hazard called out for the JWKS cache in *Dual-Token Validation in p3_api* above; fix it in both places, not just the Node one.
+- The signer allowlist (`trust_token_signers` from `P3AuthConstants`) is the Perl analogue of the `iss` check. The JWT path needs an equivalent explicit issuer pin, plus an `aud` check that has no current counterpart.
+
+**Pre-existing bug, unrelated to OAuth2 but in the blast radius:** `validate()` line 30 computes `$token_str` from either a string or an object (`ref($token) ? $token->token() : $token`), but line 39 then calls `$token->token()` unconditionally when building `%vars`. Passing a plain string dies rather than validating. Every current caller passes an object, so it is latent — but it will surface the moment someone refactors this method for dual-format dispatch. Fix it as part of that work.
 
 #### 4a. Inventory findings (app_service only)
 
@@ -884,7 +909,7 @@ Groups are resolved at login time and cached in the token. With short-lived acce
 1. **BFF scope** — full API proxy (no token in JS at all) or in-memory access token with server-side refresh? The latter is proposed above as the pragmatic choice; confirm.
 2. **Idle session policy** — preserve today's "logged out unless mouse active" behavior, or move to refresh-token-window semantics? These give noticeably different UX for long-running analysis sessions.
 3. **Impersonation re-auth** — is `prompt=login` acceptable to admins, or is the current password re-prompt preferred for familiarity?
-4. **Where do `P3AuthToken.pm` and `P3TokenValidator.pm` live?** Neither is in the local checkouts. They are the load-bearing modules for Phase 4 and must be located and read before that phase can be estimated.
+4. ~~**Where do `P3AuthToken.pm` and `P3TokenValidator.pm` live?**~~ **Resolved:** `git@github.com:olsonanl/p3_auth`, vendored at `dev_container/modules/p3_auth/lib/`. Both read and inventoried — see *4a-0* above. The shim strategy is confirmed viable. Remaining sub-question: who owns `p3_auth` releases, and how does a change there propagate to the deployed CLI and to `app_service`?
 5. **Perl CLI repo inventory** — the `p3-*` command distribution has not been surveyed at all. Run the same `un=` / `SigningSubject` / `tokenid` / `split(/\|/)` / `P3AuthToken` grep there.
 6. **Non-interactive Perl callers** — `ignore_authrc => 1` and `KB_INTERACTIVE` imply scripted users who cannot complete a device flow. Enumerate them and decide their migration path (Client Credentials? provisioned credential?) before Phase 6 removes legacy tokens.
 7. **`Awe.pm`'s `Datatoken` header** — is AWE still in the request path? If yes, does it need the JWT too; if no, delete.
