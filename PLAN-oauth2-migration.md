@@ -323,8 +323,8 @@ The auth service is to be served at a single origin (`auth.bv-brc.org`) while we
 | Property | Production | Non-production | Codebase |
 |---|---|---|---|
 | BV-BRC | `bv-brc.org`, `www.bv-brc.org` | `alpha.bv-brc.org`, `beta.bv-brc.org`, `dev-N.bv-brc.org` | `bvbrc_website` |
-| DXKB | `dxkb.org` | `dev.dxkb.org`, `test.dxkb.org` | TBD — confirm |
-| LDKB | `ldkb.org` | `dev.ldkb.org`, `test.ldkb.org` | TBD — confirm |
+| DXKB | `dxkb.org` | `dev.dxkb.org`, `test.dxkb.org` | `bvbrc_website` today → **React rewrite in 9–12 months** |
+| LDKB | `ldkb.org` | `dev.ldkb.org`, `test.ldkb.org` | **Greenfield, likely React** |
 | MAAGE | `maage-brc.org` | `dev.maage-brc.org`, `test.maage-brc.org` | `MAAGE-Web` (separate repo) |
 
 **Neither the hostname prefixes nor the environment count are uniform across properties.** BV-BRC uses `alpha.`/`beta.`/`dev-N.`; the other three use `dev.`/`test.`. Since `redirect_uri` matching is exact-string, no naming convention can paper over this — every hostname is enumerated individually regardless.
@@ -338,18 +338,31 @@ This drives the client count. Totalling the known hosts — BV-BRC at 4+ (prod/w
 
 (Whether every property truly needs every tier still needs confirming — see open question 16.)
 
-**These are similar but divergent sibling codebases, not one app behind four vhosts.** `MAAGE-Web` is a distinct repository with unrelated git history that nonetheless carries the same `p3app.js` / `WorkspaceManager.js` architecture — including its own copy of the inline `Authorization` sites.
+**These are similar but divergent sibling codebases, not one app behind four vhosts** — and two of the four are on their way off Dojo entirely (Robert, 2026-09-08):
 
-**Porting to the other properties is explicitly a later step** (Robert, 2026-09-08). The work happens in `bvbrc_website` first. But that makes portability a *design constraint on how the code is written here*, and it is cheap to honor up front and expensive to retrofit:
+- **DXKB** currently runs the same codebase as BV-BRC, but **moves to a new React site in the next 9–12 months.**
+- **LDKB** is **greenfield, probably React** — no Dojo inheritance to port to at all.
+- **MAAGE** (`MAAGE-Web`) is a distinct repository with unrelated git history that nonetheless carries the same `p3app.js` / `WorkspaceManager.js` architecture — including its own copy of the inline `Authorization` sites. This is the one true Dojo port target.
 
-- Keep the auth client surface in **self-contained modules with no BV-BRC-specific imports** — `auth/authHeaders.js`, the BFF session client, the callback handler. A sibling repo should be able to copy the directory, not archaeologize a diff.
-- **All origin/issuer/client-id values come from config**, never a literal in a module. Each property will substitute its own; a hardcoded `bv-brc.org` is a portability bug even though it works here.
-- Keep the diff **mechanical and reviewable** — the port to a divergent codebase is a manual reapplication, and it goes far better against a change that is "add a module, replace N call sites with a call to it" than against one entangled with unrelated refactoring.
-- Where a change *must* touch divergent shared code (`p3app.js`), keep it as small and as localized as possible for the same reason.
+**This reframes what "portable" has to mean.** Only MAAGE (and DXKB in the interim) can receive a Dojo-shaped port. LDKB and post-rewrite DXKB will consume the auth design as an *API and a protocol*, not as copied AMD modules. So the portable artifact is split in two:
 
-Do not build a shared cross-repo package for this now — that is a larger coordination problem than the migration itself. Write portable code, port it deliberately later.
+- **Portable across all four: the server side and the contract.** The BFF endpoints (`/auth/login`, `/auth/callback`, `/auth/session`, `/auth/refresh`, `/auth/logout`), the session-cookie semantics, the client-registration table, and the token-shape expectations. A React app can implement the same BFF contract from scratch in a day if the contract is written down; it cannot inherit a Dojo module at all. **Write the BFF as an Express router that is independent of the Dojo app**, and document the endpoint contract in this repo as the normative spec — that document, not the JavaScript, is the deliverable the React sites consume.
+- **Portable to MAAGE only: the Dojo client modules.** `auth/authHeaders.js`, the session client, the callback handler.
 
-(`patricbrc.org`, `viprbrc.org`, and `fludb.org` appear throughout the codebase but are **not** in the initial rollout set. They remain relevant as *realms* — see the ViPR subsection at the end — and as legacy redirect targets, but they do not need BFF clients in the initial rollout.)
+Two consequences worth acting on now:
+
+- **Do not over-invest in making the Dojo client side portable.** Its audience is one repo (MAAGE), plus DXKB for a year. The earlier instinct to keep it copy-paste-clean is still right — it is nearly free — but it should not shape decisions. If a choice trades Dojo-side elegance for a cleaner BFF contract, take the contract.
+- **The React sites are a reason to get the BFF boundary right the first time.** A greenfield LDKB will be built against whatever the contract says. If the BFF leaks Dojo assumptions (`p3app.js`-shaped session objects, `A*` localStorage conventions, PATRIC-specific user-record fields), LDKB inherits them permanently. Keep the session payload minimal and standards-shaped: `sub`, expiry, and the claims a UI actually renders.
+
+**Porting to the other properties remains explicitly a later step.** The work happens in `bvbrc_website` first. Supporting constraints:
+
+- **All origin/issuer/client-id values come from config**, never a literal in a module. Each property substitutes its own; a hardcoded `bv-brc.org` is a portability bug even though it works here.
+- Keep the diff **mechanical and reviewable** — the port to MAAGE is a manual reapplication, and it goes far better against "add a module, replace N call sites with a call to it" than against something entangled with unrelated refactoring.
+- Where a change *must* touch divergent shared code (`p3app.js`), keep it small and localized for the same reason.
+
+Do not build a shared cross-repo JavaScript package for this now — that is a larger coordination problem than the migration itself, and with two of four consumers becoming React it would be a package with a shrinking audience. Write portable code, document the contract, port deliberately later.
+
+(`patricbrc.org`, `viprbrc.org`, and `fludb.org` appear throughout the codebase but are **not** in the initial rollout set. They remain relevant as *realms* carried in existing `sub` values — see the ViPR subsection at the end — and as legacy redirect targets, but they get no BFF clients. `viprbrc.org` in particular is **closed to new credentials**, so it is a migration concern only, never a rollout target.)
 
 ### The good news: the OIDC flows are structurally CORS-free
 
@@ -369,14 +382,14 @@ The only flows that would introduce new browser→`auth.bv-brc.org` XHR are RP-i
 
 ### The real constraint: the BFF session cookie cannot span registrable domains
 
-The BFF section above specifies a host-scoped `httpOnly`/`Secure`/`SameSite=Lax` session cookie. A cookie set by `www.bv-brc.org` **cannot be read by `www.viprbrc.org`** — different registrable domains. No cookie attribute changes this (`Domain=` only widens within one registrable domain), and the historical workarounds all depend on third-party cookies, which are being removed.
+The BFF section above specifies a host-scoped `httpOnly`/`Secure`/`SameSite=Lax` session cookie. A cookie set by `www.bv-brc.org` **cannot be read by `www.dxkb.org`** — different registrable domains. No cookie attribute changes this (`Domain=` only widens within one registrable domain), and the historical workarounds all depend on third-party cookies, which are being removed.
 
 So "one BFF for all properties" is not viable. **Recommended: one BFF per property, one shared IdP.**
 
 - Each property runs its own confidential OIDC client with its own host-scoped session cookie
 - `auth.bv-brc.org` holds the shared **IdP session**
 - SSO still works: a user already authenticated at the IdP who lands on a second property is redirected through `/auth` and back **without a login prompt** — the IdP session cookie is first-party to `auth.bv-brc.org` during that redirect, so no third-party cookie is involved
-- Single logout needs explicit design (RP-initiated logout / OIDC front-channel logout), since clearing one property's session cookie does not clear the others'
+- Single logout does not follow from SSO — clearing one property's session cookie does not clear the others'. **Per-site logout is accepted for the initial rollout** (Robert, 2026-09-08); the one thing that must not be foreclosed is a **server-side session store keyed by session id, recording `sub` and the IdP `sid`**, since back-channel logout is unbuildable without it. See open question 15 for the full options analysis and why front-channel logout is a dead end.
 
 Rejected alternatives: a single BFF that other properties call cross-origin (reintroduces credentialed cross-origin XHR — more moving parts and worse failure modes than it saves), and any cross-domain cookie scheme.
 
@@ -437,18 +450,24 @@ Consequences today:
 
 Also relevant: p3_api sets `Content-Security-Policy` (`app.js:125`) but neither service sets CORS-adjacent hardening headers on the auth surface. `auth.bv-brc.org` should send a restrictive CSP of its own, and **should not enable CORS at all** — nothing legitimately fetches it from a browser under this design. An OIDC provider with permissive CORS is a liability, not a feature.
 
-### `viprbrc.org` is a realm, not merely a domain
+### `viprbrc.org` is a closed realm — migrate the existing users, build nothing new
 
 `LoginForm.js:76-93` has a live **ViPR login path** that authenticates `<user>@viprbrc.org` against `https://p3.theseed.org/goauth/token` with HTTP Basic, entirely outside p3_user. `p3app.js:838` then strips `@viprbrc.org` to derive the userid, and `loginWithVipr()` handles the result.
 
-This matters well beyond CORS:
+**Decision (Robert, 2026-09-08): no new `viprbrc.org` credentials will be created. It was a transitory realm for the IRD/ViPR-into-BV-BRC integration.** That settles the design question and simplifies it considerably:
 
-- It is a **fourth realm** (`viprbrc.org`) alongside `bvbrc`, `patricbrc.org`, and whatever `fludb` users carry, and it authenticates against a **different identity provider on a third-party origin**.
-- The login template tells users they may log in with "PATRIC or IRD/ViPR BRC username or email... while we are merging these resources together" — so this is a transitional state the OAuth2 migration should be resolving, not preserving.
-- Under OIDC this becomes an **upstream IdP in p3_oidc** (same treatment as Google/ORCID/GitHub) or a bulk account migration — not a bespoke browser-side Basic-auth XHR to `p3.theseed.org`.
-- The `sub` decision above assumes `username@realm`. Confirm what `sub` a ViPR-origin user receives and whether existing ViPR identities keep `@viprbrc.org` or are migrated to `@bvbrc`. Their Solr `owner` fields and workspace paths already contain the old realm, so migration is not a mere rename — it is the same class of problem as the `sub` decision itself.
+- **`viprbrc.org` is not an upstream IdP in p3_oidc.** Do not build a federation connector to `p3.theseed.org`. The realm is closed to new registrations, so there is no ongoing flow to support — only an existing population to carry across.
+- **`LoginForm.js:76-93` and `loginWithVipr()` are removal targets, not port targets.** The browser-side Basic-auth XHR to a third-party origin disappears with the legacy login form in Phase 3a. Nothing replaces it. This also removes one of the cross-origin credentialed-request cases from the CORS analysis above.
+- **The remaining work is a bounded, one-time migration**, sized by however many `@viprbrc.org` accounts are actually in the user store. Count them early — if the number is small, individual outreach beats any automated linking scheme.
 
-Resolve this before Phase 3b, since it shares all its machinery with social-provider account linking.
+**What is still open is the `sub` question, and it is unavoidable.** Existing ViPR identities already appear as `@viprbrc.org` in Solr `owner` / `user_read` / `user_write` fields and in workspace paths. Since `sub` = `username@realm`, there are two options and they are not equivalent:
+
+- **Keep `sub` = `<user>@viprbrc.org` for the migrated population.** Zero data migration; their existing objects and workspace paths keep resolving. Cost: a dead realm string persists in `sub` values indefinitely, and the realm list never shrinks.
+- **Migrate them to `@bvbrc`.** Clean namespace. Cost: this is *not a rename* — it is a rewrite of `owner`, `user_read`, `user_write` across Solr plus a workspace path migration, with a correctness risk on every object the user has shared. Same class of problem as the `sub` decision itself.
+
+**Recommendation: keep `@viprbrc.org` in `sub` for existing users.** The realm being closed means the string is a frozen historical artifact of bounded size, not a growing liability. Rewriting live ownership data to retire a string is a poor trade. Treat `patricbrc.org` identically and for the same reason.
+
+This no longer blocks Phase 3b (social login), since ViPR is not becoming a social-style upstream provider. It does need to be settled before Phase 3a removes the legacy login form, so the migrated users have a working path in.
 
 ---
 
@@ -653,6 +672,10 @@ Split into three independently shippable sub-phases.
 **Phase 3a — BFF + OIDC login with BV-BRC credentials only**
 - Add `/callback` route to website backend for code exchange
 - Implement the BFF session layer: server-side refresh token storage, session cookie, `POST /auth/refresh`, `POST /auth/logout`
+  - **The session store must be server-side, keyed by session id, and record `sub` and the IdP's `sid` on every record.** Not a self-contained signed cookie. This is what refresh-token rotation, reuse detection, admin session revocation, and any future back-channel logout all require — see open question 15.
+  - **Logout is local-only for now**: clear the BFF cookie *and* revoke the refresh token at the IdP. Revocation is what bounds the exposure, so it is not optional.
+- Write the BFF endpoint contract down as a **normative spec document** in this repo — it is the artifact the LDKB/DXKB React sites will implement against, and it should be reviewable independently of the Dojo client code
+- Remove the ViPR Basic-auth login path (`LoginForm.js:76-93`, `loginWithVipr()`, the `@viprbrc.org` strip at `p3app.js:838`) — the realm is closed to new credentials
 - Update `LoginForm.js` — redirect-based OIDC flow (no social buttons yet)
 - Update `p3app.js` — JWT-aware `login()`/`checkLogin()`; in-memory access token; cross-tab logout signal replacing `localStorage` token polling; resolve the idle-refresh (`activeMouse`) question
 - Flip `authHeaders.js` to emit `Bearer <jwt>` (one file, thanks to Phase 0)
@@ -750,7 +773,21 @@ The Phase-3 Token Exchange design for jobs lands directly on this code, so the t
 Mirroring the JavaScript situation, four Perl sites hardcode the `OAuth` scheme:
 - `Shock.pm:23`, `Awe.pm:175` (which *also* sends a non-standard `Datatoken` header carrying the same token), `Quick.pm:266`, `AppScript.pm:325`
 
-These need the same centralization treatment as Phase 0 does for the browser: one helper that emits the right scheme, so the JWT flip is a single edit. `Awe.pm`'s `Datatoken` header needs a decision — retain, or drop if AWE is no longer in the path.
+These need the same centralization treatment as Phase 0 does for the browser: one helper that emits the right scheme, so the JWT flip is a single edit.
+
+**Two of those four are dead and drop out of scope** (Robert, 2026-09-08: "AWE is no longer in the picture"). Verified in `synack-2025-12/app_service`:
+
+- **`Shock.pm` has zero `use` sites.** No file in `app_service` does `use Bio::KBase::AppService::Shock`. It is unreferenced.
+- **`Awe.pm` has no live caller.** Four files `use` it — `Monitor.pm:10`, `Quick.pm:16`, `scripts/codon-tree-stats.pl:7`, `service-scripts/gather-stats.pl:6` — but:
+  - `Monitor.pm` is the only one that actually *instantiates* it (`:40`, `:78`, as `Awe->new($impl->{awe_server}, session('token'))`), and **`awe_server` is never populated**. `AppServiceImpl.pm` never sets the key; the only `awe-server` value in the tree is a stale `deploy.cfg` pointing at `http://redwood.mcs.anl.gov:7080`. Those calls would construct against `undef` today. `Monitor.pm` is mounted at `/monitor` in both `AppService.psgi:52` and `AppServiceAsync.psgi:53`, so it is *reachable* — which makes it dead code that is also exposed, and worth deleting on its own merits rather than porting.
+  - `Quick.pm:16` `use`s `Awe` but never calls it — a leftover import.
+  - The two scripts are the same two already flagged in *4d* below as using the older `Bio::KBase::AuthToken`, and need the same live/dead determination.
+
+**Net effect on Phase 4c: the `OAuth` → `Bearer` work is two sites, not four — `Quick.pm:266` and `AppScript.pm:325`.** `AppScript.pm` is the one that matters; `Quick.pm` is mounted at `/quick` in both `.psgi` files and is a genuine raw-regex site (`:132`), so it stays in scope.
+
+The `Datatoken` header question is closed: **drop it.** Do not carry a non-standard token header into the JWT design.
+
+Preferred disposition for the dead modules is **delete `Awe.pm`, `AweEvents.pm`, `Shock.pm`, and `Monitor.pm`, and drop the stale `use` from `Quick.pm`** — as a separate cleanup commit, before Phase 4 rather than during it. That keeps the auth migration's diff to code that is actually live, and removes an unauthenticated-looking mounted route in the process. It is not on the OAuth2 critical path; it just shrinks it.
 
 #### 4d. Validation path
 
@@ -1023,7 +1060,14 @@ Groups are resolved at login time and cached in the token. With short-lived acce
 - `lib/Bio/KBase/AppService/SlurmCluster.pm:1023` — `split(/\|/)`; confirm whether token-related
 
 *`OAuth` → `Bearer` header sites (`app_service/`):*
-- `lib/Bio/KBase/AppService/Shock.pm:23`, `Awe.pm:175` (plus non-standard `Datatoken` header), `Quick.pm:266`, `AppScript.pm:325`
+- `lib/Bio/KBase/AppService/AppScript.pm:325`
+- `lib/Bio/KBase/AppService/Quick.pm:266`
+- ~~`Shock.pm:23`, `Awe.pm:175`~~ — dead, see *4c*. AWE is out of the picture; `Shock.pm` has no `use` sites.
+
+*Dead-code cleanup (separate commit, before Phase 4):*
+- Delete `Awe.pm`, `AweEvents.pm`, `Shock.pm`, `Monitor.pm`; drop the stale `use ...::Awe` from `Quick.pm:16`
+- Unmount `/monitor` from `lib/AppService.psgi:52` and `lib/AppServiceAsync.psgi:53`
+- Remove the stale `awe-server` entries from `deploy.cfg:4,26`
 
 *Job token plumbing (coordinate with Phase 3 Token Exchange):*
 - `lib/Bio/KBase/AppService/Schema/Result/TaskToken.pm` — schema change, `token` → `ticket_hash`
@@ -1051,14 +1095,49 @@ Groups are resolved at login time and cached in the token. With short-lived acce
 4. ~~**Where do `P3AuthToken.pm` and `P3TokenValidator.pm` live?**~~ **Resolved:** `git@github.com:olsonanl/p3_auth`, vendored at `dev_container/modules/p3_auth/lib/`. Both read and inventoried — see *4a-0* above. The shim strategy is confirmed viable. Remaining sub-question: who owns `p3_auth` releases, and how does a change there propagate to the deployed CLI and to `app_service`?
 5. **Perl CLI repo inventory** — the `p3-*` command distribution has not been surveyed at all. Run the same `un=` / `SigningSubject` / `tokenid` / `split(/\|/)` / `P3AuthToken` grep there.
 6. **Non-interactive Perl callers** — `ignore_authrc => 1` and `KB_INTERACTIVE` imply scripted users who cannot complete a device flow. Enumerate them and decide their migration path (Client Credentials? provisioned credential?) before Phase 6 removes legacy tokens.
-7. **`Awe.pm`'s `Datatoken` header** — is AWE still in the request path? If yes, does it need the JWT too; if no, delete.
+7. ~~**`Awe.pm`'s `Datatoken` header** — is AWE still in the request path?~~ **Resolved** (Robert, 2026-09-08): AWE is no longer in the picture. Drop the `Datatoken` header; `Awe.pm` and `Shock.pm` are dead and leave Phase 4c with two `OAuth`-scheme sites instead of four. See *4c* for the verification and the proposed cleanup commit. Remaining sub-question: `codon-tree-stats.pl` and `gather-stats.pl` still `use` `Awe` *and* the older `Bio::KBase::AuthToken` — they are the same live/dead determination as open question 5's CLI survey, so settle both together.
 8. **`TaskToken` migration strategy** — confirm the dual-column approach for in-flight jobs is acceptable to operations, and who owns the schema change.
 9. **Workspace/app service `Bearer` support** — does it exist already, or is it work? Blocks Phase 0's server-side counterpart.
 10. **Are there non-browser, non-CLI legacy token consumers** (external collaborators, cron jobs) that would need notice before Phase 6? The Phase 2 metrics should answer this empirically.
 11. **Separate non-production IdP (`auth-dev.bv-brc.org`) or shared?** Recommended separate — the only way to rehearse key rotation, secret rotation, and p3_oidc upgrades without touching production auth. One shared non-production instance serves every property's dev/alpha/beta tier, so it is two IdP deployments total, not five. Decide before Phase 1, since it doubles what Phase 1 builds. If separate: shared `users` collection with distinct `oidc_*` collections, or full isolation?
-12. **What are DXKB and LDKB, exactly?** Forks of `bvbrc_website`, forks of `MAAGE-Web`, or additional deployments of one of them? Determines how many codebases the Phase 0 port eventually touches, and whether their `Authorization` call sites have drifted from the ~294 counted here.
+12. ~~**What are DXKB and LDKB, exactly?**~~ **Resolved** (Robert, 2026-09-08): DXKB runs the same codebase as BV-BRC today but moves to a **new React site in 9–12 months**; LDKB is **greenfield, probably React**. So the Dojo port target is MAAGE plus DXKB-in-the-interim — see the reframing above. The **BFF endpoint contract, written down as a normative spec, is the artifact the React sites consume**; the Dojo modules are not portable to them. Remaining sub-question: does the DXKB React rewrite land before or after Phase 3? If after, DXKB needs the Dojo port and then discards it — in which case consider deferring DXKB's port entirely and letting the rewrite pick up OIDC natively, rather than paying for it twice.
 13. **Do the three `withCredentials: true` call sites matter?** They cannot work cross-origin today (no `Access-Control-Allow-Credentials` is ever sent, due to the `credential` typo). Are they same-origin in production, or quietly broken? Answer before changing the CORS config.
-14. **ViPR realm disposition** — `LoginForm.js:76` authenticates `@viprbrc.org` users against `p3.theseed.org` outside p3_user entirely. Becomes an upstream IdP in p3_oidc, a bulk account migration, or a removal? Their existing Solr `owner` values and workspace paths carry `@viprbrc.org`, so this is a `sub`-level decision, not a UI cleanup. Blocks Phase 3b.
-15. **Single logout across properties** — with one BFF session cookie per property, logging out of one does not log out the others. Is OIDC front-channel logout in scope, or is per-property logout acceptable initially?
+14. ~~**ViPR realm disposition**~~ **Resolved** (Robert, 2026-09-08): **no new `viprbrc.org` credentials will be created** — it was a transitory realm for the IRD/ViPR integration. Therefore: no upstream-IdP connector, and `LoginForm.js:76-93` / `loginWithVipr()` are removal targets. No longer blocks Phase 3b. Remaining sub-question: how many `@viprbrc.org` accounts exist, and do they keep `@viprbrc.org` in `sub` (recommended — see above) or get migrated to `@bvbrc`? Must be settled before Phase 3a retires the legacy login form.
+15. **Single logout across properties** — **Decided for now** (Robert, 2026-09-08): **per-site logout is acceptable.** Recorded here with the options and their implications, since this is a design the initial build must not foreclose.
+
+    **The problem.** Under the BFF design there are *N+1* independent sessions: one host-scoped session cookie per property BFF (`bv-brc.org`, `dxkb.org`, `ldkb.org`, `maage-brc.org`), plus the IdP's own session cookie on `auth.bv-brc.org`. SSO works because a second property's authorization request finds the IdP session already established and returns without a prompt. Logout does not compose the same way: clearing one property's cookie leaves both the other properties' cookies *and* the IdP session intact.
+
+    That produces three distinguishable behaviors, and it matters which one "logout" means:
+
+    | Action | BFF session cleared | IdP session cleared | Effect on other properties |
+    |---|---|---|---|
+    | **Local logout** | this one | no | none — and re-login here is silent (no prompt) |
+    | **RP-initiated logout** (`end_session_endpoint`) | this one | yes | none *immediately*; they stay logged in until their own session expires, but a *new* login anywhere prompts |
+    | **Single logout** (front-channel or back-channel) | this one | yes | all cleared |
+
+    The middle row is the trap. RP-initiated logout is the one most teams reach for because `oidc-provider` supports it out of the box, but its user-visible effect is *asymmetric*: the user clicked "log out" on BV-BRC and is still logged in on DXKB — yet the DXKB session can no longer be silently renewed. It is arguably more confusing than plain local logout, not less.
+
+    **The options.**
+
+    1. **Local logout only** (chosen for now). The BFF clears its own cookie and revokes its refresh token at the IdP. The IdP session survives. Simple, no new endpoints, and the failure mode is well-understood.
+       - *Implication:* on a shared machine, logging out of BV-BRC and navigating to DXKB lands the user still authenticated as themselves. In a lab or classroom this is a real exposure, not a theoretical one. **Revoking the refresh token is what makes this defensible** — the user's ability to *continue* is bounded by the access-token lifetime, which is why the access token must be short (5–15 min), not hours.
+       - *Also:* clicking "log out" then "log in" appears to do nothing, because the IdP session silently re-authenticates. Some sites add `prompt=login` on the *next* login after an explicit logout to make it feel honest. Cheap; worth doing.
+
+    2. **RP-initiated logout** (OIDC RP-Initiated Logout 1.0). Redirect to the IdP's `end_session_endpoint` with `id_token_hint` and `post_logout_redirect_uri`; the IdP kills its own session and redirects back.
+       - *Cost:* every property needs its `post_logout_redirect_uri` registered — **another exact-match URI per client**, on the same enumerated list as `redirect_uri`, with the same 400-at-runtime failure mode if missed.
+       - *Implication:* the asymmetry above. Only choose this over option 1 if the "next login must prompt" property is worth more than the confusion.
+
+    3. **Front-channel logout** (OIDC Front-Channel Logout 1.0). The IdP's logout page embeds a hidden `<iframe>` per registered RP hitting each one's `frontchannel_logout_uri`, so each BFF clears its own cookie.
+       - **This is the option that is actively decaying.** Those iframes are third-party contexts across registrable domains — exactly what Chrome's third-party-cookie restrictions, Safari ITP, and Firefox Total Cookie Protection block. The iframe loads, the `Set-Cookie: ...; Max-Age=0` is dropped, and logout *silently* half-fails. There is no error to observe. **Do not build this.**
+
+    4. **Back-channel logout** (OIDC Back-Channel Logout 1.0). The IdP POSTs a signed logout token server-to-server to each RP's `backchannel_logout_uri`. No browser involvement, so no cookie-policy exposure.
+       - **This is the correct answer if single logout is ever required**, and it is the one to keep the door open for.
+       - *Cost:* it forces the BFF's session store to become **server-side and externally addressable by `sid`**. A logout token identifies the session by `sub` and/or `sid`; the BFF must be able to find and destroy that session without the user's browser present. A stateless signed-cookie session cannot do this at all.
+
+    **The one decision this forces today, despite deferring the feature:** make the BFF session store **server-side, keyed by a session id, with `sub` and the IdP's `sid` recorded on each record** — Redis or Mongo, not a self-contained signed cookie. This is the design that keeps option 4 reachable. It also happens to be what refresh-token rotation, reuse detection, and admin-initiated session revocation all need independently, so it is not speculative work — it is the same store three other requirements already ask for. Retrofitting it later means touching every property's BFF simultaneously.
+
+    Correspondingly: **register a `backchannel_logout_uri` placeholder per client from the start** if it is free to do so, so the client table does not need a coordinated update later.
+
+    Revisit if any of these become true: a shared-workstation deployment appears; a security review requires "log out everywhere"; or an admin needs to terminate a compromised user's sessions across properties (which is the same mechanism).
 16. **Confirm the remainder of the hostname matrix.** DXKB, LDKB and MAAGE are confirmed at `dev.` + `test.` each; BV-BRC at `alpha.` + `beta.` + `dev-N.`. Still to enumerate: how many `dev-N.bv-brc.org` hosts, local-dev ports, and whether `www.` and apex are both live for each property. Every hostname is an exact-match `redirect_uri` and a CORS allowlist entry, so the list must live in explicit config, never be generated by interpolation over a property name.
 17. **Who owns client-secret rotation?** 13+ confidential BFF clients on an annual rotation is a standing operational process, not a one-off. Needs a named owner and a scripted procedure before Phase 3 puts the first ones into production.
