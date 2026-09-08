@@ -316,6 +316,124 @@ If the BFF is judged too large for Phase 3, the fallback is: access token in mem
 
 ---
 
+## Multi-Domain Rollout and CORS
+
+The auth service is to be served at a single origin (`auth.bv-brc.org`) while web properties span **several registrable domains, not just subdomains**:
+
+| Property | Production | Alpha | Codebase |
+|---|---|---|---|
+| BV-BRC | `bv-brc.org` | `alpha.bv-brc.org` | `bvbrc_website` |
+| DXKB | `dxkb.org` | `alpha.dxkb.org` | TBD — confirm |
+| LDKB | `ldkb.org` | `alpha.ldkb.org` | TBD — confirm |
+| MAAGE | `maage-brc.org` | `alpha.maage-brc.org` | `MAAGE-Web` (separate repo) |
+
+**These are similar but divergent sibling codebases, not one app behind four vhosts.** `MAAGE-Web` is a distinct repository with unrelated git history that nonetheless carries the same `p3app.js` / `WorkspaceManager.js` architecture — including its own copy of the inline `Authorization` sites.
+
+**Porting to the other properties is explicitly a later step** (Robert, 2026-09-08). The work happens in `bvbrc_website` first. But that makes portability a *design constraint on how the code is written here*, and it is cheap to honor up front and expensive to retrofit:
+
+- Keep the auth client surface in **self-contained modules with no BV-BRC-specific imports** — `auth/authHeaders.js`, the BFF session client, the callback handler. A sibling repo should be able to copy the directory, not archaeologize a diff.
+- **All origin/issuer/client-id values come from config**, never a literal in a module. Each property will substitute its own; a hardcoded `bv-brc.org` is a portability bug even though it works here.
+- Keep the diff **mechanical and reviewable** — the port to a divergent codebase is a manual reapplication, and it goes far better against a change that is "add a module, replace N call sites with a call to it" than against one entangled with unrelated refactoring.
+- Where a change *must* touch divergent shared code (`p3app.js`), keep it as small and as localized as possible for the same reason.
+
+Do not build a shared cross-repo package for this now — that is a larger coordination problem than the migration itself. Write portable code, port it deliberately later.
+
+(`patricbrc.org`, `viprbrc.org`, and `fludb.org` appear throughout the codebase but are **not** in the initial rollout set. They remain relevant as *realms* — see the ViPR subsection at the end — and as legacy redirect targets, but they do not need BFF clients in the initial rollout.)
+
+### The good news: the OIDC flows are structurally CORS-free
+
+This is a significant argument for the standard flows over a bespoke XHR-based login. Nothing in the critical path is a cross-origin browser fetch:
+
+| Step | Mechanism | Cross-origin XHR? |
+|---|---|---|
+| `/auth` authorization request | Top-level browser redirect | No — a navigation, not a fetch |
+| Login form + consent | Served by `auth.bv-brc.org` to itself | No |
+| `/callback` code exchange | Server-to-server from the BFF | No — never leaves the datacenter |
+| Device flow (CLI) | Native HTTP client | No — no `Origin` header at all |
+| Discovery + JWKS | Fetched server-side by p3_api / BFF | No |
+| `POST /auth/refresh` | XHR to the property's **own** origin | No — same-origin by design |
+| JWT sent to p3_api | XHR with `Authorization` header | **Yes** — but this is the situation today |
+
+The only flows that would introduce new browser→`auth.bv-brc.org` XHR are RP-initiated silent renewal (hidden iframe / `prompt=none`) and a JS-side `/userinfo` call. **The BFF design removes the need for both** — renewal is a same-origin call to the BFF, and profile data comes from the ID token. Keep it that way; if silent-renewal-via-iframe is ever proposed, note it also depends on third-party cookies and is being broken by browsers regardless.
+
+### The real constraint: the BFF session cookie cannot span registrable domains
+
+The BFF section above specifies a host-scoped `httpOnly`/`Secure`/`SameSite=Lax` session cookie. A cookie set by `www.bv-brc.org` **cannot be read by `www.viprbrc.org`** — different registrable domains. No cookie attribute changes this (`Domain=` only widens within one registrable domain), and the historical workarounds all depend on third-party cookies, which are being removed.
+
+So "one BFF for all properties" is not viable. **Recommended: one BFF per property, one shared IdP.**
+
+- Each property runs its own confidential OIDC client with its own host-scoped session cookie
+- `auth.bv-brc.org` holds the shared **IdP session**
+- SSO still works: a user already authenticated at the IdP who lands on a second property is redirected through `/auth` and back **without a login prompt** — the IdP session cookie is first-party to `auth.bv-brc.org` during that redirect, so no third-party cookie is involved
+- Single logout needs explicit design (RP-initiated logout / OIDC front-channel logout), since clearing one property's session cookie does not clear the others'
+
+Rejected alternatives: a single BFF that other properties call cross-origin (reintroduces credentialed cross-origin XHR — more moving parts and worse failure modes than it saves), and any cross-domain cookie scheme.
+
+### Per-property registration details
+
+- **`redirect_uri` is exact-match in `oidc-provider`** — no wildcards, no pattern matching, by specification. Enumerate every URI before Phase 1 rather than discovering them one `400 invalid_redirect_uri` at a time.
+- **Register one client per property**, not one shared client. Distinct client IDs give per-property revocation, per-property secrets, and usable audit logs.
+
+**Do the alpha environments need their own support? Yes — but the answer splits in two.**
+
+*Redirect URIs: unavoidably yes.* `https://alpha.bv-brc.org/callback` is a different exact string from `https://www.bv-brc.org/callback`, so it must be registered or alpha login simply fails. Same for local dev (`https://localhost:3000/callback`) and any `dev-N` host. This part is not a design choice.
+
+*Clients: yes, and they should be **separate** clients rather than extra URIs on the production client.* Registering alpha's callback as a second URI on the production client is the tempting shortcut and it is the wrong call:
+
+- A confidential client's secret would then be shared between production and a lower-trust environment. Compromise of alpha becomes compromise of production.
+- The client is the unit of revocation, rate limiting, and audit. Merged clients mean alpha traffic is indistinguishable from production traffic in the logs — which is exactly backwards, since alpha is where the anomalies will be.
+- Alpha wants different settings anyway: shorter token lifetimes, relaxed consent for testing, possibly test upstream IdP credentials.
+
+So: `bvbrc-web` and `bvbrc-web-alpha`, `maage-web` and `maage-web-alpha`, and so on. Client registration should be **config-driven and scripted**, not hand-entered — with four properties in two environments that is 8+ clients at minimum, and hand-registration will drift.
+
+**The sharper question is whether alpha shares the production IdP at all.** Two defensible answers, and this needs an explicit decision:
+
+1. **Shared IdP, separate clients** (simpler). Alpha points at `auth.bv-brc.org`, real users, real accounts. But an OIDC provider bug or misconfiguration exercised from alpha lands on production auth, and alpha testers' sessions are production sessions.
+2. **A separate `auth-alpha.bv-brc.org` instance** (safer, and recommended). Alpha gets its own issuer, its own signing keys, its own MongoDB OIDC collections. This is the only way to test **key rotation, client-secret rotation, upstream IdP configuration changes, and p3_oidc upgrades** without touching production auth — and those are precisely the operations the *Key Management Procedures* section says to rehearse. It also means an alpha token cannot be replayed against production, because `iss` and `aud` will not match the pins p3_api enforces.
+
+Option 2 costs one more service instance and one more set of upstream IdP registrations (Google/ORCID/GitHub each need alpha callback URLs too). Given that Phase 1 stands up p3_oidc from scratch anyway, standing up two is marginal additional work at the point where it is cheapest — and it gives a place to test Phase 6's legacy-removal before it is irreversible. Note that **user accounts are already shared across properties and environments today**: both `bvbrc_website/p3-web.conf` and `MAAGE-Web/p3-web.conf` point `userServiceURL` and `accountURL` at the same `https://user.patricbrc.org`. So a separate alpha IdP does *not* automatically mean separate accounts, and the decision has a second half: does `auth-alpha` read the same `users` collection (real accounts, isolated grants and sessions — the pragmatic choice), or a distinct one (full isolation, but testers need separate accounts)? Reading the shared `users` collection while keeping distinct `oidc_*` collections is probably the right balance, and it is consistent with how the environments already relate.
+- **`SameSite=Lax` is correct only for a top-level GET callback.** If any property is configured with `response_mode=form_post`, the callback arrives as a **cross-site POST**, on which a `Lax` cookie is *not* sent — login fails silently and confusingly. Pin the response mode to the default query form, or the cookie must become `SameSite=None; Secure`, which is a materially weaker CSRF posture. Prefer pinning the response mode.
+- **`state` and PKCE are per-property**, generated and verified by that property's BFF.
+
+### Existing CORS configuration is broken, and must not be naively "fixed"
+
+Both API services configure `cors` with **two misspelled option names**, verified against the vendored `cors/lib/index.js` (which reads `options.credentials` and `options.allowedHeaders`; neither singular form appears anywhere in the library):
+
+```javascript
+// p3_api/app.js:129  and  p3_user/app.js:79
+app.use(cors({
+  origin: true,
+  allowHeaders: [...],   // WRONG — library reads `allowedHeaders`
+  credential: true,      // WRONG — library reads `credentials`
+  ...
+}))
+```
+
+Consequences today:
+
+- **`Access-Control-Allow-Credentials` is never sent** by either service.
+- `allowedHeaders` being unset means the library **reflects `Access-Control-Request-Headers`**, which is why `authorization` works cross-origin at all. It works by accident, not by configuration.
+- Three call sites set `withCredentials: true` (`app/app.js:638`, `UserProfileEditor.js:38`, `suLoginForm.js:26`). Without the ACAC response header the browser discards those responses — so either these are same-origin in production (likely, given `dataServiceURL`/`workspaceServiceURL` are relative paths) or the code path is quietly broken. **Determine which before the migration**, because the answer tells us whether anything actually depends on credentialed cross-origin requests.
+
+**Do not simply correct the spelling.** `origin: true` reflects *any* requesting origin. Combined with a working `credentials: true`, that would let any website on the internet make credentialed requests to p3_api with a victim's ambient authority. The correct sequence is: **introduce an explicit origin allowlist first, then fix the spelling, in the same change.** Note that the allowlist is exactly the set of properties enumerated for this rollout — the same list the `redirect_uri` registration needs.
+
+Also relevant: p3_api sets `Content-Security-Policy` (`app.js:125`) but neither service sets CORS-adjacent hardening headers on the auth surface. `auth.bv-brc.org` should send a restrictive CSP of its own, and **should not enable CORS at all** — nothing legitimately fetches it from a browser under this design. An OIDC provider with permissive CORS is a liability, not a feature.
+
+### `viprbrc.org` is a realm, not merely a domain
+
+`LoginForm.js:76-93` has a live **ViPR login path** that authenticates `<user>@viprbrc.org` against `https://p3.theseed.org/goauth/token` with HTTP Basic, entirely outside p3_user. `p3app.js:838` then strips `@viprbrc.org` to derive the userid, and `loginWithVipr()` handles the result.
+
+This matters well beyond CORS:
+
+- It is a **fourth realm** (`viprbrc.org`) alongside `bvbrc`, `patricbrc.org`, and whatever `fludb` users carry, and it authenticates against a **different identity provider on a third-party origin**.
+- The login template tells users they may log in with "PATRIC or IRD/ViPR BRC username or email... while we are merging these resources together" — so this is a transitional state the OAuth2 migration should be resolving, not preserving.
+- Under OIDC this becomes an **upstream IdP in p3_oidc** (same treatment as Google/ORCID/GitHub) or a bulk account migration — not a bespoke browser-side Basic-auth XHR to `p3.theseed.org`.
+- The `sub` decision above assumes `username@realm`. Confirm what `sub` a ViPR-origin user receives and whether existing ViPR identities keep `@viprbrc.org` or are migrated to `@bvbrc`. Their Solr `owner` fields and workspace paths already contain the old realm, so migration is not a mere rename — it is the same class of problem as the `sub` decision itself.
+
+Resolve this before Phase 3b, since it shares all its machinery with social-provider account linking.
+
+---
+
 ## Prerequisite: Centralize the Authorization Header
 
 **This should happen before Phase 3, and can land independently of the whole migration.**
@@ -487,7 +605,10 @@ JWT verification uses JWKS from `https://auth.bv-brc.org/.well-known/openid-conf
 - Introduce `public/js/p3/auth/authHeaders.js`; convert all ~294 inline `Authorization` sites to it, preserving the existing per-service scheme (bare for p3_api/p3_user, `OAuth ` for workspace/app service)
 - Fold in `WorkflowManager.js`'s local `getAuthHeader()`, plus the token-parameter cases in `jsonrpc.js` and `SEEDClient.js`
 - Confirm workspace and app services accept `Bearer` as well as `OAuth`
-- **Delivers:** no behavior change, but Phase 3 becomes a one-file edit instead of a 294-site edit. Ships independently on its own branch, reviewable in isolation.
+- **Fix the broken CORS configuration** in `p3_api/app.js:129` and `p3_user/app.js:79` — the `credential`/`allowHeaders` misspellings, but **only together with an explicit origin allowlist**, never the spelling alone (see *Multi-Domain Rollout and CORS*). The allowlist is the same property list the `redirect_uri` registration needs, so the two should be derived from one config source.
+- Determine whether the three `withCredentials: true` call sites depend on cross-origin credentialed requests, or are same-origin in production
+- Write the new modules to be **portable to the sibling property codebases** — self-contained, config-driven, no hardcoded origins
+- **Delivers:** no behavior change, but Phase 3 becomes a one-file edit instead of a 294-site edit, and the CORS posture stops being accidental. Ships independently on its own branch, reviewable in isolation.
 
 ### Phase 1: Deploy p3_oidc (Foundation)
 - Create `p3_oidc` service with `oidc-provider`, MongoDB adapter, `findAccount` reading existing `users` collection
@@ -916,3 +1037,8 @@ Groups are resolved at login time and cached in the token. With short-lived acce
 8. **`TaskToken` migration strategy** — confirm the dual-column approach for in-flight jobs is acceptable to operations, and who owns the schema change.
 9. **Workspace/app service `Bearer` support** — does it exist already, or is it work? Blocks Phase 0's server-side counterpart.
 10. **Are there non-browser, non-CLI legacy token consumers** (external collaborators, cron jobs) that would need notice before Phase 6? The Phase 2 metrics should answer this empirically.
+11. **Separate alpha IdP (`auth-alpha.bv-brc.org`) or shared?** Recommended separate — it is the only way to rehearse key rotation, secret rotation, and p3_oidc upgrades without touching production auth. Decide before Phase 1, since it doubles the deployment being built. If separate: shared `users` collection with distinct `oidc_*` collections, or full isolation?
+12. **What are DXKB and LDKB, exactly?** Forks of `bvbrc_website`, forks of `MAAGE-Web`, or additional deployments of one of them? Determines how many codebases the Phase 0 port eventually touches, and whether their `Authorization` call sites have drifted from the ~294 counted here.
+13. **Do the three `withCredentials: true` call sites matter?** They cannot work cross-origin today (no `Access-Control-Allow-Credentials` is ever sent, due to the `credential` typo). Are they same-origin in production, or quietly broken? Answer before changing the CORS config.
+14. **ViPR realm disposition** — `LoginForm.js:76` authenticates `@viprbrc.org` users against `p3.theseed.org` outside p3_user entirely. Becomes an upstream IdP in p3_oidc, a bulk account migration, or a removal? Their existing Solr `owner` values and workspace paths carry `@viprbrc.org`, so this is a `sub`-level decision, not a UI cleanup. Blocks Phase 3b.
+15. **Single logout across properties** — with one BFF session cookie per property, logging out of one does not log out the others. Is OIDC front-channel logout in scope, or is per-property logout acceptable initially?
