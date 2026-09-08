@@ -320,12 +320,18 @@ If the BFF is judged too large for Phase 3, the fallback is: access token in mem
 
 The auth service is to be served at a single origin (`auth.bv-brc.org`) while web properties span **several registrable domains, not just subdomains**:
 
-| Property | Production | Alpha | Codebase |
+| Property | Production | Non-production | Codebase |
 |---|---|---|---|
-| BV-BRC | `bv-brc.org` | `alpha.bv-brc.org` | `bvbrc_website` |
-| DXKB | `dxkb.org` | `alpha.dxkb.org` | TBD — confirm |
-| LDKB | `ldkb.org` | `alpha.ldkb.org` | TBD — confirm |
-| MAAGE | `maage-brc.org` | `alpha.maage-brc.org` | `MAAGE-Web` (separate repo) |
+| BV-BRC | `bv-brc.org`, `www.bv-brc.org` | `alpha.bv-brc.org`, `beta.bv-brc.org`, `dev-N.bv-brc.org` | `bvbrc_website` |
+| DXKB | `dxkb.org` | `dev.dxkb.org` | TBD — confirm |
+| LDKB | `ldkb.org` | *confirm — `dev.`?* | TBD — confirm |
+| MAAGE | `maage-brc.org` | `dev.maage-brc.org` | `MAAGE-Web` (separate repo) |
+
+**Neither the hostname prefixes nor the environment count are uniform across properties.** BV-BRC has at least three non-production tiers (`alpha`, `beta`, `dev-N`); the others use a single `dev.`. Since `redirect_uri` matching is exact-string, no naming convention can paper over this — every hostname is enumerated individually regardless.
+
+The consequence is for tooling and config: **derive the URI and client lists from an explicit per-property, per-environment config table — never from string interpolation over a property name.** Anything of the form `` `https://${env}.${property}/callback` `` will be wrong for at least two of these properties on the first try, and the failure mode is a `400 invalid_redirect_uri` at login rather than anything that shows up in testing the generator. The same table drives the CORS origin allowlist, so getting it wrong breaks two things at once.
+
+This also sharpens the client-count question below: at roughly 4 properties × 2–4 environments, this is 10–16 registered clients, not the 8 estimated before. Scripted registration is not optional at that count. (LDKB's non-production hostname is assumed by analogy and needs confirming, as does whether every property truly needs every tier.)
 
 **These are similar but divergent sibling codebases, not one app behind four vhosts.** `MAAGE-Web` is a distinct repository with unrelated git history that nonetheless carries the same `p3app.js` / `WorkspaceManager.js` architecture — including its own copy of the inline `Authorization` sites.
 
@@ -374,26 +380,33 @@ Rejected alternatives: a single BFF that other properties call cross-origin (rei
 - **`redirect_uri` is exact-match in `oidc-provider`** — no wildcards, no pattern matching, by specification. Enumerate every URI before Phase 1 rather than discovering them one `400 invalid_redirect_uri` at a time.
 - **Register one client per property**, not one shared client. Distinct client IDs give per-property revocation, per-property secrets, and usable audit logs.
 
-**Do the alpha environments need their own support? Yes — but the answer splits in two.**
-
-*Redirect URIs: unavoidably yes.* `https://alpha.bv-brc.org/callback` is a different exact string from `https://www.bv-brc.org/callback`, so it must be registered or alpha login simply fails. Same for local dev (`https://localhost:3000/callback`) and any `dev-N` host. This part is not a design choice.
-
-*Clients: yes, and they should be **separate** clients rather than extra URIs on the production client.* Registering alpha's callback as a second URI on the production client is the tempting shortcut and it is the wrong call:
-
-- A confidential client's secret would then be shared between production and a lower-trust environment. Compromise of alpha becomes compromise of production.
-- The client is the unit of revocation, rate limiting, and audit. Merged clients mean alpha traffic is indistinguishable from production traffic in the logs — which is exactly backwards, since alpha is where the anomalies will be.
-- Alpha wants different settings anyway: shorter token lifetimes, relaxed consent for testing, possibly test upstream IdP credentials.
-
-So: `bvbrc-web` and `bvbrc-web-alpha`, `maage-web` and `maage-web-alpha`, and so on. Client registration should be **config-driven and scripted**, not hand-entered — with four properties in two environments that is 8+ clients at minimum, and hand-registration will drift.
-
-**The sharper question is whether alpha shares the production IdP at all.** Two defensible answers, and this needs an explicit decision:
-
-1. **Shared IdP, separate clients** (simpler). Alpha points at `auth.bv-brc.org`, real users, real accounts. But an OIDC provider bug or misconfiguration exercised from alpha lands on production auth, and alpha testers' sessions are production sessions.
-2. **A separate `auth-alpha.bv-brc.org` instance** (safer, and recommended). Alpha gets its own issuer, its own signing keys, its own MongoDB OIDC collections. This is the only way to test **key rotation, client-secret rotation, upstream IdP configuration changes, and p3_oidc upgrades** without touching production auth — and those are precisely the operations the *Key Management Procedures* section says to rehearse. It also means an alpha token cannot be replayed against production, because `iss` and `aud` will not match the pins p3_api enforces.
-
-Option 2 costs one more service instance and one more set of upstream IdP registrations (Google/ORCID/GitHub each need alpha callback URLs too). Given that Phase 1 stands up p3_oidc from scratch anyway, standing up two is marginal additional work at the point where it is cheapest — and it gives a place to test Phase 6's legacy-removal before it is irreversible. Note that **user accounts are already shared across properties and environments today**: both `bvbrc_website/p3-web.conf` and `MAAGE-Web/p3-web.conf` point `userServiceURL` and `accountURL` at the same `https://user.patricbrc.org`. So a separate alpha IdP does *not* automatically mean separate accounts, and the decision has a second half: does `auth-alpha` read the same `users` collection (real accounts, isolated grants and sessions — the pragmatic choice), or a distinct one (full isolation, but testers need separate accounts)? Reading the shared `users` collection while keeping distinct `oidc_*` collections is probably the right balance, and it is consistent with how the environments already relate.
 - **`SameSite=Lax` is correct only for a top-level GET callback.** If any property is configured with `response_mode=form_post`, the callback arrives as a **cross-site POST**, on which a `Lax` cookie is *not* sent — login fails silently and confusingly. Pin the response mode to the default query form, or the cookie must become `SameSite=None; Secure`, which is a materially weaker CSRF posture. Prefer pinning the response mode.
 - **`state` and PKCE are per-property**, generated and verified by that property's BFF.
+
+### Non-production environments
+
+**Do `alpha.bv-brc.org`, `beta.bv-brc.org`, `dev.dxkb.org` and friends need their own support? Yes — and the answer splits in two.**
+
+*Redirect URIs: unavoidably yes.* `https://alpha.bv-brc.org/callback` is a different exact string from `https://www.bv-brc.org/callback`, so it must be registered or that environment's login simply fails. Same for `beta`, each `dev-N`, and local dev (`https://localhost:3000/callback`). Not a design choice — a consequence of exact-match.
+
+*Clients: yes, and they should be **separate** clients rather than extra URIs bolted onto the production client.* Adding a non-production callback as a second URI on the production client is the tempting shortcut and it is the wrong call:
+
+- A confidential client's secret would then be shared between production and a lower-trust environment. Compromise of `dev.dxkb.org` becomes compromise of production.
+- The client is the unit of revocation, rate limiting, and audit. Merged clients make non-production traffic indistinguishable from production in the logs — exactly backwards, since the pre-production tiers are where the anomalies will be.
+- These environments want different settings anyway: shorter token lifetimes, relaxed consent for testing, test upstream IdP credentials.
+
+So `bvbrc-web`, `bvbrc-web-alpha`, `bvbrc-web-beta`, `maage-web`, `maage-web-dev`, and so on — **10–16 clients** across the property × environment matrix above. At that count, client registration must be **config-driven and scripted**, not hand-entered in a console; hand-registration will drift, and drift here presents as intermittent login failures in one environment.
+
+**The sharper question is whether non-production shares the production IdP at all.** Two defensible answers; this needs an explicit decision:
+
+1. **Shared IdP, separate clients** (simpler). Non-production points at `auth.bv-brc.org` with real users and real accounts. But a p3_oidc bug or misconfiguration exercised from a dev tier lands on production auth, and testers' sessions are production sessions.
+2. **A separate non-production IdP instance** — `auth-dev.bv-brc.org` or similar (safer, and recommended). Its own issuer, own signing keys, own MongoDB OIDC collections. This is the only way to test **key rotation, client-secret rotation, upstream IdP configuration changes, and p3_oidc upgrades** without touching production auth — precisely the operations the *Key Management Procedures* section says to rehearse. It also means a dev-issued token cannot be replayed against production, because `iss` and `aud` will not match the pins p3_api enforces.
+
+Note that option 2 means **one non-production IdP shared by all properties' dev tiers**, not one per environment — `alpha.bv-brc.org`, `beta.bv-brc.org`, and `dev.dxkb.org` can all be clients of the same `auth-dev`. Two IdP instances total, not five.
+
+The cost is one more service instance and one more set of upstream IdP registrations (Google/ORCID/GitHub each need non-production callback URLs too). Since Phase 1 stands up p3_oidc from scratch anyway, standing up two is marginal work at the point where it is cheapest — and it provides somewhere to rehearse Phase 6's legacy removal before that becomes irreversible.
+
+**On accounts:** user accounts are already shared across properties and environments today — both `bvbrc_website/p3-web.conf` and `MAAGE-Web/p3-web.conf` point `userServiceURL` and `accountURL` at the same `https://user.patricbrc.org`. So a separate non-production IdP does *not* automatically mean separate accounts. The second half of the decision: does `auth-dev` read the same `users` collection (real accounts, isolated grants and sessions — the pragmatic choice), or a distinct one (full isolation, but testers need separate accounts)? Shared `users` with distinct `oidc_*` collections is probably the right balance and is consistent with how these environments already relate.
 
 ### Existing CORS configuration is broken, and must not be naively "fixed"
 
@@ -780,7 +793,7 @@ Also present: two scripts use the older `Bio::KBase::AuthToken` instead of `P3Au
 - **RSA-SHA1 → RS256** — significant cryptographic upgrade (also addresses FIPS 140-2/SC-13 — SHA-1 is deprecated for digital signatures under NIST SP 800-131A)
 - **Rate limiting** on `/token` and `/device/authorize` endpoints
 - **Device flow: rate-limit the verification page too.** The plan rate-limits `/device/authorize` (code issuance) but the brute-force target is the *user-facing* `/device` page where a `user_code` is entered. Require adequate `user_code` entropy, rate-limit attempts per session/IP, and invalidate a `device_code` after a small number of failed `user_code` entries.
-- **Redirect URI allowlisting** — exact-match only, no wildcards, no scheme-relative values. Register the precise `/callback` URLs for each deployment (prod, alpha, dev).
+- **Redirect URI allowlisting** — exact-match only, no wildcards, no scheme-relative values. Register the precise `/callback` URL for every property and every environment; see the hostname matrix in *Multi-Domain Rollout and CORS* for the full list and the reason it cannot be generated by interpolation.
 - **`state` parameter** in addition to PKCE, for CSRF protection on the callback.
 - **Open-redirect review on `/callback`** — any post-login `returnTo` must be validated against a same-origin allowlist, not reflected.
 - **Content Security Policy.** With access tokens in JS memory, CSP is the primary XSS mitigation. Worth an assessment during Phase 3 even if a strict policy is a longer project for a Dojo codebase.
@@ -1037,8 +1050,9 @@ Groups are resolved at login time and cached in the token. With short-lived acce
 8. **`TaskToken` migration strategy** — confirm the dual-column approach for in-flight jobs is acceptable to operations, and who owns the schema change.
 9. **Workspace/app service `Bearer` support** — does it exist already, or is it work? Blocks Phase 0's server-side counterpart.
 10. **Are there non-browser, non-CLI legacy token consumers** (external collaborators, cron jobs) that would need notice before Phase 6? The Phase 2 metrics should answer this empirically.
-11. **Separate alpha IdP (`auth-alpha.bv-brc.org`) or shared?** Recommended separate — it is the only way to rehearse key rotation, secret rotation, and p3_oidc upgrades without touching production auth. Decide before Phase 1, since it doubles the deployment being built. If separate: shared `users` collection with distinct `oidc_*` collections, or full isolation?
+11. **Separate non-production IdP (`auth-dev.bv-brc.org`) or shared?** Recommended separate — the only way to rehearse key rotation, secret rotation, and p3_oidc upgrades without touching production auth. One shared non-production instance serves every property's dev/alpha/beta tier, so it is two IdP deployments total, not five. Decide before Phase 1, since it doubles what Phase 1 builds. If separate: shared `users` collection with distinct `oidc_*` collections, or full isolation?
 12. **What are DXKB and LDKB, exactly?** Forks of `bvbrc_website`, forks of `MAAGE-Web`, or additional deployments of one of them? Determines how many codebases the Phase 0 port eventually touches, and whether their `Authorization` call sites have drifted from the ~294 counted here.
 13. **Do the three `withCredentials: true` call sites matter?** They cannot work cross-origin today (no `Access-Control-Allow-Credentials` is ever sent, due to the `credential` typo). Are they same-origin in production, or quietly broken? Answer before changing the CORS config.
 14. **ViPR realm disposition** — `LoginForm.js:76` authenticates `@viprbrc.org` users against `p3.theseed.org` outside p3_user entirely. Becomes an upstream IdP in p3_oidc, a bulk account migration, or a removal? Their existing Solr `owner` values and workspace paths carry `@viprbrc.org`, so this is a `sub`-level decision, not a UI cleanup. Blocks Phase 3b.
 15. **Single logout across properties** — with one BFF session cookie per property, logging out of one does not log out the others. Is OIDC front-channel logout in scope, or is per-property logout acceptable initially?
+16. **Confirm the full hostname matrix.** Prefixes are not uniform (`alpha.`/`beta.` for BV-BRC, `dev.` for the others) and the tier count varies per property. LDKB's non-production hostname is assumed by analogy and unverified; `dev-N.bv-brc.org` hosts and local-dev ports need enumerating too. Every one is an exact-match `redirect_uri` and an entry in the CORS origin allowlist, so the list must live in explicit config, never be generated by interpolation over a property name.
