@@ -323,15 +323,20 @@ The auth service is to be served at a single origin (`auth.bv-brc.org`) while we
 | Property | Production | Non-production | Codebase |
 |---|---|---|---|
 | BV-BRC | `bv-brc.org`, `www.bv-brc.org` | `alpha.bv-brc.org`, `beta.bv-brc.org`, `dev-N.bv-brc.org` | `bvbrc_website` |
-| DXKB | `dxkb.org` | `dev.dxkb.org` | TBD — confirm |
-| LDKB | `ldkb.org` | *confirm — `dev.`?* | TBD — confirm |
-| MAAGE | `maage-brc.org` | `dev.maage-brc.org` | `MAAGE-Web` (separate repo) |
+| DXKB | `dxkb.org` | `dev.dxkb.org`, `test.dxkb.org` | TBD — confirm |
+| LDKB | `ldkb.org` | `dev.ldkb.org`, `test.ldkb.org` | TBD — confirm |
+| MAAGE | `maage-brc.org` | `dev.maage-brc.org`, `test.maage-brc.org` | `MAAGE-Web` (separate repo) |
 
-**Neither the hostname prefixes nor the environment count are uniform across properties.** BV-BRC has at least three non-production tiers (`alpha`, `beta`, `dev-N`); the others use a single `dev.`. Since `redirect_uri` matching is exact-string, no naming convention can paper over this — every hostname is enumerated individually regardless.
+**Neither the hostname prefixes nor the environment count are uniform across properties.** BV-BRC uses `alpha.`/`beta.`/`dev-N.`; the other three use `dev.`/`test.`. Since `redirect_uri` matching is exact-string, no naming convention can paper over this — every hostname is enumerated individually regardless.
 
-The consequence is for tooling and config: **derive the URI and client lists from an explicit per-property, per-environment config table — never from string interpolation over a property name.** Anything of the form `` `https://${env}.${property}/callback` `` will be wrong for at least two of these properties on the first try, and the failure mode is a `400 invalid_redirect_uri` at login rather than anything that shows up in testing the generator. The same table drives the CORS origin allowlist, so getting it wrong breaks two things at once.
+The consequence is for tooling and config: **derive the URI and client lists from an explicit per-property, per-environment config table — never from string interpolation over a property name.** Anything of the form `` `https://${env}.${property}/callback` `` is wrong for BV-BRC on the first try, and the failure mode is a `400 invalid_redirect_uri` at login rather than anything that surfaces while testing the generator. The same table drives the CORS origin allowlist, so an error there breaks two things at once.
 
-This also sharpens the client-count question below: at roughly 4 properties × 2–4 environments, this is 10–16 registered clients, not the 8 estimated before. Scripted registration is not optional at that count. (LDKB's non-production hostname is assumed by analogy and needs confirming, as does whether every property truly needs every tier.)
+This drives the client count. Totalling the known hosts — BV-BRC at 4+ (prod/www, alpha, beta, one or more `dev-N`) and three properties at 3 each (prod, dev, test) — gives **13+ registered clients minimum, and 16+ once local-dev and additional `dev-N` hosts are included**. Two consequences:
+
+- **Scripted, config-driven registration is mandatory**, not a nicety. Hand-registering 16 clients across two IdP instances guarantees drift, and drift here presents as one environment intermittently failing to log in.
+- **The client-secret inventory is now the dominant key-management burden.** Every one of these is a BFF, and a BFF is by definition a confidential client, so each carries its own secret — they cannot be made public clients without abandoning the BFF pattern. The *OAuth2 Client Secrets* section below specifies annual rotation; at 16 clients that is a real operational process needing a named owner and a scripted procedure, not an afterthought. It also means **16 secrets distributed across hosts of varying trust**, which is an independent argument for the separate non-production IdP: a leaked `test.ldkb.org` secret should not be a credential against the production issuer.
+
+(Whether every property truly needs every tier still needs confirming — see open question 16.)
 
 **These are similar but divergent sibling codebases, not one app behind four vhosts.** `MAAGE-Web` is a distinct repository with unrelated git history that nonetheless carries the same `p3app.js` / `WorkspaceManager.js` architecture — including its own copy of the inline `Authorization` sites.
 
@@ -395,7 +400,7 @@ Rejected alternatives: a single BFF that other properties call cross-origin (rei
 - The client is the unit of revocation, rate limiting, and audit. Merged clients make non-production traffic indistinguishable from production in the logs — exactly backwards, since the pre-production tiers are where the anomalies will be.
 - These environments want different settings anyway: shorter token lifetimes, relaxed consent for testing, test upstream IdP credentials.
 
-So `bvbrc-web`, `bvbrc-web-alpha`, `bvbrc-web-beta`, `maage-web`, `maage-web-dev`, and so on — **10–16 clients** across the property × environment matrix above. At that count, client registration must be **config-driven and scripted**, not hand-entered in a console; hand-registration will drift, and drift here presents as intermittent login failures in one environment.
+So `bvbrc-web`, `bvbrc-web-alpha`, `bvbrc-web-beta`, `maage-web`, `maage-web-dev`, `maage-web-test`, and so on — **13+ clients** across the property × environment matrix above, and 16+ once local-dev and additional `dev-N` hosts are counted. At that scale, registration must be config-driven and scripted, and the secret inventory needs an owner; see the matrix discussion above.
 
 **The sharper question is whether non-production shares the production IdP at all.** Two defensible answers; this needs an explicit decision:
 
@@ -1055,4 +1060,5 @@ Groups are resolved at login time and cached in the token. With short-lived acce
 13. **Do the three `withCredentials: true` call sites matter?** They cannot work cross-origin today (no `Access-Control-Allow-Credentials` is ever sent, due to the `credential` typo). Are they same-origin in production, or quietly broken? Answer before changing the CORS config.
 14. **ViPR realm disposition** — `LoginForm.js:76` authenticates `@viprbrc.org` users against `p3.theseed.org` outside p3_user entirely. Becomes an upstream IdP in p3_oidc, a bulk account migration, or a removal? Their existing Solr `owner` values and workspace paths carry `@viprbrc.org`, so this is a `sub`-level decision, not a UI cleanup. Blocks Phase 3b.
 15. **Single logout across properties** — with one BFF session cookie per property, logging out of one does not log out the others. Is OIDC front-channel logout in scope, or is per-property logout acceptable initially?
-16. **Confirm the full hostname matrix.** Prefixes are not uniform (`alpha.`/`beta.` for BV-BRC, `dev.` for the others) and the tier count varies per property. LDKB's non-production hostname is assumed by analogy and unverified; `dev-N.bv-brc.org` hosts and local-dev ports need enumerating too. Every one is an exact-match `redirect_uri` and an entry in the CORS origin allowlist, so the list must live in explicit config, never be generated by interpolation over a property name.
+16. **Confirm the remainder of the hostname matrix.** DXKB, LDKB and MAAGE are confirmed at `dev.` + `test.` each; BV-BRC at `alpha.` + `beta.` + `dev-N.`. Still to enumerate: how many `dev-N.bv-brc.org` hosts, local-dev ports, and whether `www.` and apex are both live for each property. Every hostname is an exact-match `redirect_uri` and a CORS allowlist entry, so the list must live in explicit config, never be generated by interpolation over a property name.
+17. **Who owns client-secret rotation?** 13+ confidential BFF clients on an annual rotation is a standing operational process, not a one-off. Needs a named owner and a scripted procedure before Phase 3 puts the first ones into production.
