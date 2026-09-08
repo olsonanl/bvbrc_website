@@ -28,11 +28,13 @@ The header format is **not uniform today**, and the differences are load-bearing
 
 | Convention | Count | Sent to | Notes |
 |---|---|---|---|
-| Bare token (`window.App.authorizationToken`) | ~287 | p3_api, p3_user | No scheme prefix at all |
-| `OAuth <token>` | 4 | Workspace service, app service | `WorkspaceManager.js:859,1176`, `UploadManager.js:32` |
+| Bare token (`window.App.authorizationToken`) | ~287 | p3_api, p3_user, **Workspace RPC, app service RPC** | No scheme prefix at all |
+| `OAuth <token>` | 4 | **Shock** (download/upload node URLs) | `WorkspaceManager.js:864,1181`, `UploadManager.js:32` |
 | `Oauth <token>` (lowercase 'a') | 2 | App service stdout/stderr URLs | `JobManager.js:229,240` |
 
-This is not merely cosmetic sloppiness — **p3_api rejects a prefixed token.** `p3_api/middleware/auth.js` passes the raw header value straight into `p3_user/validateToken.js`, which does `token.split('|')` and reconstructs the signed base string from the parts. With an `OAuth ` prefix the first part parses as key `"OAuth un"`, the reconstructed base string no longer matches what was signed, and RSA verification fails. So the bare-token convention is *required* for p3_api and the `OAuth ` convention is *required* for the workspace/app services.
+This is not merely cosmetic sloppiness — **p3_api rejects a prefixed token.** `p3_api/middleware/auth.js` passes the raw header value straight into `p3_user/validateToken.js`, which does `token.split('|')` and reconstructs the signed base string from the parts. With an `OAuth ` prefix the first part parses as key `"OAuth un"`, the reconstructed base string no longer matches what was signed, and RSA verification fails.
+
+**The same constraint applies to the Workspace and app service JSON-RPC APIs** — a server-side survey (2026-09-08) found that neither strips a scheme prefix either, so both require a bare token exactly as p3_api does. `WorkspaceManager`'s RPC client sends one (`jsonrpc.js:11`). The `OAuth `-prefixed sites are **Shock** node URLs, not Workspace or app-service endpoints; the sole exception is the app service's `/task_info` mount. This corrects the earlier "workspace/app service require `OAuth `" reading — see *4c-1* for the evidence and for what it changes about `authHeaders.js`.
 
 **Implication for the migration:** the plan's original Phase 3 line "update `Authorization` headers from raw token to `Bearer <jwt>`" understates the work by two orders of magnitude. See *Prerequisite: Centralize the Authorization Header* below.
 
@@ -481,7 +483,9 @@ Proposed refactor (mechanical, no behavior change, ships on its own branch):
 
 ```javascript
 // public/js/p3/auth/authHeaders.js
-// scheme: 'api' (bare, for p3_api/p3_user) | 'oauth' (workspace/app service)
+// scheme: 'api'   -> bare token. p3_api, p3_user, Workspace RPC, app service RPC.
+//                    This is the default and covers ~287 of the ~294 sites.
+// scheme: 'oauth' -> 'OAuth ' prefix. Shock node URLs only (+ app service /task_info).
 function authHeader(scheme) { ... }
 ```
 
@@ -490,9 +494,11 @@ function authHeader(scheme) { ... }
 - `WorkflowManager.js:22` already has a local `getAuthHeader()` — fold it in
 - `jsonrpc.js:11` and `SEEDClient.js:137` take the token as a parameter; route those through the helper too
 
+**Name the `'oauth'` scheme after Shock, not after a service tier.** The survey in *4c-1* found the discriminator is not "workspace/app service vs. API" — both of those speak bare tokens on their RPC paths. It is Shock (plus the one `/task_info` mount). A helper documented the old way invites a future caller to reach for `authHeader('oauth')` when adding a Workspace call, which fails signature verification server-side with a misleading error.
+
 Once this exists, the Phase 3 change is: `authHeader()` returns `'Bearer ' + jwt`, in one file. Without it, Phase 3 is a 294-site edit with a per-site correctness question, done at the same time as everything else is changing.
 
-**Server-side counterpart:** the workspace and app services must accept `Bearer` in addition to `OAuth`. Verify this before flipping the client, or the two conventions diverge in the wrong direction.
+**Server-side counterpart:** **no service accepts `Bearer` today** — the string appears nowhere in `Workspace` or `app_service` (surveyed 2026-09-08). That support is real work, and it belongs in `P3TokenValidator`/`P3AuthToken` where Phase 4 already schedules it. The good news is that the client-side flip is simpler than assumed: since the RPC paths already require bare tokens, most call sites change scheme exactly once, at the Phase 3 flip.
 
 ---
 
@@ -639,9 +645,9 @@ JWT verification uses JWKS from `https://auth.bv-brc.org/.well-known/openid-conf
 ## Phased Migration
 
 ### Phase 0: Centralize the Authorization header (prerequisite)
-- Introduce `public/js/p3/auth/authHeaders.js`; convert all ~294 inline `Authorization` sites to it, preserving the existing per-service scheme (bare for p3_api/p3_user, `OAuth ` for workspace/app service)
+- Introduce `public/js/p3/auth/authHeaders.js`; convert all ~294 inline `Authorization` sites to it, preserving the existing per-destination scheme (**bare for p3_api, p3_user, Workspace RPC and app service RPC; `OAuth ` for Shock only** — see *4c-1*)
 - Fold in `WorkflowManager.js`'s local `getAuthHeader()`, plus the token-parameter cases in `jsonrpc.js` and `SEEDClient.js`
-- Confirm workspace and app services accept `Bearer` as well as `OAuth`
+- ~~Confirm workspace and app services accept `Bearer`~~ — **surveyed: they do not, and neither strips any scheme prefix.** Adding `Bearer` support is Phase 4 work in `P3TokenValidator`/`P3AuthToken`, not a Phase 0 confirmation step.
 - **Fix the broken CORS configuration** in `p3_api/app.js:129` and `p3_user/app.js:79` — the `credential`/`allowHeaders` misspellings, but **only together with an explicit origin allowlist**, never the spelling alone (see *Multi-Domain Rollout and CORS*). The allowlist is the same property list the `redirect_uri` registration needs, so the two should be derived from one config source.
 - Determine whether the three `withCredentials: true` call sites depend on cross-origin credentialed requests, or are same-origin in production
 - Write the new modules to be **portable to the sibling property codebases** — self-contained, config-driven, no hardcoded origins
@@ -757,7 +763,9 @@ The comment says "Let admins (Bob for now) submit when the service is down." It 
 
 The Phase-3 Token Exchange design for jobs lands directly on this code, so the two must be planned together:
 
-- **`TaskToken` table** (`Schema/Result/TaskToken.pm`) stores `task_id`, `token` (TEXT), `expiration` (TIMESTAMP). This is the "bearer token at rest in the scheduler DB" the plan proposes to eliminate — replaced by the one-time ticket. Written at `Scheduler.pm:333`, `Schema.pm:65`, `SchedulerDB.pm:220`; read at `SlurmCluster.pm:822` (`order_by expiration DESC`, single row).
+- **`TaskToken` table** (`Schema/Result/TaskToken.pm`) stores `task_id`, `token` (TEXT), `expiration` (TIMESTAMP). This is the "bearer token at rest in the scheduler DB" the plan proposes to eliminate — replaced by the one-time ticket. Written at `Scheduler.pm:333`, `Schema.pm:65`, `SchedulerDB.pm:220`; read at `SlurmCluster.pm:853` (`order_by expiration DESC`, single row). Verified against the current `app_service` checkout, 2026-09-08.
+- **The table has no primary key and no index** (`Schema.sql:326-332`): just `task_id INTEGER`, `token TEXT`, `expiration TIMESTAMP DEFAULT NULL`, and a foreign key to `Task(id)`. Multiple rows per task are expected — `SlurmCluster.pm:853` explicitly takes the one with the longest expiration ("use the token with the longest expiration"). Any `ticket_hash` migration must preserve the multi-row-per-task shape, or find and change that selection logic too.
+- **`SlurmCluster.pm:854-859` fails the task outright when no token row is found** (`state_code => 'F'` with a warning). Under the ticket model this is the natural place for redemption failure to surface, and its behavior — hard-fail rather than retry — should be a deliberate choice, not an inherited one. A ticket that has already been redeemed is indistinguishable here from one that was never written.
 - **`expiration` is derived from `$token->expiry`** (`Scheduler.pm:336`, `Schema.pm:68`, `SchedulerDB.pm:222`). Under the ticket model this column changes meaning — it becomes the ticket's validity window, not the token's.
 - **`slurm_batch.tt:71-72`** exports the token into the job environment:
   ```
@@ -790,6 +798,62 @@ The `Datatoken` header question is closed: **drop it.** Do not carry a non-stand
 Preferred disposition for the dead modules is **delete `Awe.pm`, `AweEvents.pm`, `Shock.pm`, `Monitor.pm`, the two stats scripts, and the top-level `awe` script; drop the stale `use` from `Quick.pm`** — as a separate cleanup commit, before Phase 4 rather than during it. That keeps the auth migration's diff to code that is actually live, and removes an exposed mounted route in the process. It is not on the OAuth2 critical path; it just shrinks it.
 
 **One reason to actually do the deletion rather than merely note it: `SRC_SERVICE_PERL = $(wildcard service-scripts/*.pl)` (`Makefile:25`).** Every `.pl` in that directory is built into `$(BIN_DIR)` and deployed to `$(SERVICE_DIR)/bin` with no per-file opt-in. So `gather-stats.pl` **ships on every deploy today** despite being dead, and any Phase 4 sweep that greps deployed Perl for token handling will keep finding it. Deleting the file is the only way to take it out of the build.
+
+#### 4c-1. Correction: the `OAuth` convention is narrower than documented
+
+The `Workspace` repo (`../Workspace`, at `041fc04`) was surveyed 2026-09-08 to answer open question 9. It **overturns the "workspace service requires `OAuth `" rule** recorded in `CLAUDE.md` and in the *Authorization header* section above.
+
+**No Workspace server code strips a scheme prefix.** All four validation entry points pass the raw header value straight into `P3AuthToken->new(token => $token, ignore_authrc => 1)`:
+
+- `Service.pm:225` (`auth_ping`) and `Service.pm:269` (`call_method` — the JSON-RPC dispatch path that gates every authenticated method)
+- `WorkspaceImpl.pm:1521` (`_set_auth_request`)
+- `WorkspaceCompletion.psgi:32`
+
+There is no `s/^OAuth //`, no `Bearer` handling, and no regex over the scheme anywhere in `Workspace/lib`. So the Workspace API is subject to **exactly the same constraint as p3_api**: a prefixed token would be split on `|`, the first field would parse as key `"OAuth un"`, and the reconstructed base string would not match the signature. **The Workspace JSON-RPC API requires a bare token.**
+
+And that is in fact what it receives. `WorkspaceManager.init()` (`WorkspaceManager.js:1654`) builds its RPC client as `RPC(apiUrl, token)`, and `jsonrpc.js:11` sends `Authorization: token` — bare, no scheme. `p3app.js:508-514` passes `this.authorizationToken` directly.
+
+**So what are the `OAuth ` sites actually talking to?** Shock, not Workspace:
+
+- `WorkspaceManager.js:864` and `:1181` — both `xhr.get(meta.link_reference + '?download')`. `link_reference` is a **Shock node URL**, not a Workspace endpoint.
+- `UploadManager.js:32` — the upload URL, also Shock.
+- On the Perl side, **every** `OAuth ` site is a Shock call, with no exceptions once the URLs are traced:
+  - `WorkspaceImpl.pm:343,790,793,800,811,830,1823,3126` — `$self->_shockurl()` / `$obj->{shocknode}` operations
+  - `WSFileMember.pm:98` — documented `curl` against `shock_api`
+  - `WorkspaceClientExt.pm:109` (`shock_read_bytes($url,...)`), `:342` (`$meta->shock_url`), `:386` and `:455` (both `my $shock_url = $res->[11]`, the Shock URL the Workspace RPC hands back) — these *look* like Workspace-client calls from the module name, but the target is Shock in all four
+  - `WorkspaceTests.pm:319` — POSTs to `$output->[0]->[11]`, the same field: a Shock URL
+
+  Field 11 of a Workspace object-meta tuple is the Shock URL; that is the tell. The pattern is always "ask Workspace over RPC with a bare token, get back a Shock URL, then talk to Shock with `OAuth `."
+
+**The app service is inconsistent with itself, and the difference is per-mount.** Surveyed in the updated `../app_service` checkout at `45f783f`:
+
+- **`AppServiceImpl.pm:90` does strip it** — `if ($auth =~ /^OAuth\s+(.*)$/i)`, with an `elsif` fallback to HTTP Basic that logs in via `P3AuthLogin::login_patric`. But this is inside **`sub _task_info`** (opens at `:62`), which is mounted only at `/task_info` — the endpoint running jobs call back into. It is not the RPC path.
+- **`AsyncService.pm:239`, the JSON-RPC `call_method` dispatch that gates every authenticated app-service method, does *not* strip.** Raw header straight into `P3AuthToken->new(token => $token, ignore_authrc => 1)`. Same at `AsyncService.pm:198` (`auth_ping`).
+
+So `OAuth ` is accepted at exactly one app-service endpoint and rejected at the main one. `AppService.psgi` and `AppServiceAsync.psgi` both mount `AppServiceImpl` for `/task_info` and the RPC handler for `/`.
+
+**Revised rule: the `OAuth ` scheme belongs to Shock (and historically AWE), plus the single `/task_info` endpoint — not to "the workspace service" or "the app service" wholesale.** The three-convention table should read:
+
+| Convention | Actually required by |
+|---|---|
+| **Bare token** | p3_api, p3_user, **the Workspace JSON-RPC API**, **the app service JSON-RPC API** |
+| `OAuth <token>` | **Shock**, and app service `/task_info` only |
+| `Oauth <token>` | app service stdout/stderr URLs (`JobManager.js`) |
+
+Two consequences for Phase 0, both concrete:
+
+- **`authHeaders.js` must key its scheme on the destination *endpoint*, not the destination service.** "Workspace vs. API" is the wrong axis and produces a helper that works on whichever path happens to get exercised first. The axis that actually predicts the answer is **Shock-or-`/task_info` vs. everything else**, and the bare-token case is now the large majority.
+- **Shock stays, so the `OAuth ` scheme stays with it.** AWE's retirement does *not* generalize: **Shock is still in play as the Workspace backing store** (Robert, 2026-09-08). Every object body lives there, so the `OAuth ` sites are the live data path — `WorkspaceImpl.pm:343,790,793,800,811,830,1823,3126` (node create, ACL set, read), `WSFileMember.pm:98`, and the browser's download/upload URLs.
+
+  This makes Shock a **first-class Phase 4/5 participant, not a cleanup item**, and it raises a question the plan has not addressed: **does Shock validate BV-BRC tokens itself, or does it just carry them?** Shock is third-party Go infrastructure — it is not going to grow JWKS verification because we ask it to. Three possibilities, and they have very different costs:
+
+  1. **Shock validates the token against p3_user's `/public_key`.** Then Shock is a legacy-token consumer that Phase 6 cannot decommission around, and it needs either a JWT-capable auth plugin or a shim endpoint that keeps serving the old format.
+  2. **Shock only checks ACLs by username**, with the token used to identify the caller via a configured auth provider. Then the integration point is that provider config, and it may be satisfiable by pointing Shock at an OIDC userinfo endpoint.
+  3. **Workspace mediates all Shock access** and the browser's direct-to-Shock URLs are pre-authorized (signed/expiring). Then the browser's `OAuth ` header may be vestigial on those requests.
+
+  `WorkspaceImpl.pm:343` PUTs an ACL for `$self->_getUsername()`, which is evidence for (2) — but the browser also sends `OAuth ` on `?download` requests, which suggests Shock does check something. **Resolve this before Phase 4**; it is the single largest unknown remaining in the Perl/service tier, and under case (1) it constrains when the legacy signing key can be retired. Note also that `Shock.pm` in `app_service` being dead does *not* mean Shock is dead — Workspace talks to it directly, via `WorkspaceImpl.pm`, not through that module.
+
+Update `CLAUDE.md`'s *Authorization header* table when this lands; it currently states the wrong rule, and the wrong rule is the kind that produces a plausible-looking helper that fails in production.
 
 #### 4d. Validation path
 
@@ -1106,8 +1170,13 @@ Groups are resolved at login time and cached in the token. With short-lived acce
 5. **Perl CLI repo inventory** — the `p3-*` command distribution has not been surveyed at all. Run the same `un=` / `SigningSubject` / `tokenid` / `split(/\|/)` / `P3AuthToken` grep there. **Add `Bio::KBase::AuthToken` to that grep**: its three `app_service` consumers are all dead, so if the CLI repo has none either, the module can be retired outright rather than taught JWTs.
 6. **Non-interactive Perl callers** — `ignore_authrc => 1` and `KB_INTERACTIVE` imply scripted users who cannot complete a device flow. Enumerate them and decide their migration path (Client Credentials? provisioned credential?) before Phase 6 removes legacy tokens.
 7. ~~**`Awe.pm`'s `Datatoken` header** — is AWE still in the request path?~~ **Resolved** (Robert, 2026-09-08): AWE is no longer in the picture. Drop the `Datatoken` header; `Awe.pm` and `Shock.pm` are dead and leave Phase 4c with two `OAuth`-scheme sites instead of four. `codon-tree-stats.pl`, `gather-stats.pl`, and the top-level `awe` script are **also dead** (Robert, 2026-09-08), which retires `Bio::KBase::AuthToken` from `app_service` entirely. See *4c*/*4d* for the verification and the cleanup commit. Note `gather-stats.pl` currently **deploys** via the `service-scripts/*.pl` wildcard in `Makefile:25`, so it must actually be deleted, not just ignored. Nothing further outstanding here beyond confirming during the open-question-5 CLI survey that `Bio::KBase::AuthToken` has no consumers there either — if not, the module itself can go.
-8. **`TaskToken` migration strategy** — confirm the dual-column approach for in-flight jobs is acceptable to operations, and who owns the schema change.
-9. **Workspace/app service `Bearer` support** — does it exist already, or is it work? Blocks Phase 0's server-side counterpart.
+8. **`TaskToken` migration strategy** — confirm the dual-column approach for in-flight jobs is acceptable to operations, and who owns the schema change. Re-verified against the current `../app_service` (`45f783f`), 2026-09-08: writers and readers are as inventoried, and two shape constraints were added to *4b* — the table has **no primary key or index** and is **intentionally multi-row per task** (`SlurmCluster.pm:853` picks the longest expiration), and `SlurmCluster.pm:854-859` **hard-fails the task** when no row is found, which is where ticket-redemption failure will surface.
+9. ~~**Workspace/app service `Bearer` support** — does it exist already, or is it work?~~ **Answered by survey** (`../Workspace` at `041fc04`, `../app_service` at `45f783f`, 2026-09-08). **No `Bearer` support exists anywhere** — the string does not appear in either repo. It is work, and it lands in `P3TokenValidator`/`P3AuthToken` where Phase 4 already puts it.
+
+    The survey also **overturned the documented `OAuth `-for-workspace rule** — see *4c-1*. Both JSON-RPC dispatch paths (`Workspace/Service.pm:269`, `app_service/AsyncService.pm:239`) pass the raw header into `P3AuthToken` with **no scheme stripping**, so both require a bare token exactly as p3_api does. Only Shock and the app service's `/task_info` endpoint (`AppServiceImpl.pm:90`) take `OAuth `.
+
+    This unblocks Phase 0's server side more than expected: the bare-token convention is already near-universal, so `authHeaders.js` keys on Shock-or-`/task_info` vs. everything else. Two follow-ups fall out:
+    - **Shock is still in play as the Workspace backing store** (Robert, 2026-09-08), so `OAuth ` does not retire with AWE. Every `OAuth ` sender is a Shock client and all of them are live. This promotes Shock to a first-class migration participant — see *4c-1* for the open sub-question of whether Shock **validates** BV-BRC tokens or merely carries them, which determines whether the legacy signing key can be retired in Phase 6 at all.
 10. **Are there non-browser, non-CLI legacy token consumers** (external collaborators, cron jobs) that would need notice before Phase 6? The Phase 2 metrics should answer this empirically.
 11. **Separate non-production IdP (`auth-dev.bv-brc.org`) or shared?** Recommended separate — the only way to rehearse key rotation, secret rotation, and p3_oidc upgrades without touching production auth. One shared non-production instance serves every property's dev/alpha/beta tier, so it is two IdP deployments total, not five. Decide before Phase 1, since it doubles what Phase 1 builds. If separate: shared `users` collection with distinct `oidc_*` collections, or full isolation?
 12. ~~**What are DXKB and LDKB, exactly?**~~ **Resolved** (Robert, 2026-09-08): DXKB runs the same codebase as BV-BRC today but moves to a **new React site in 9–12 months**; LDKB is **greenfield, probably React**. So the Dojo port target is MAAGE plus DXKB-in-the-interim — see the reframing above. The **BFF endpoint contract, written down as a normative spec, is the artifact the React sites consume**; the Dojo modules are not portable to them. Remaining sub-question: does the DXKB React rewrite land before or after Phase 3? If after, DXKB needs the Dojo port and then discards it — in which case consider deferring DXKB's port entirely and letting the rewrite pick up OIDC natively, rather than paying for it twice.
@@ -1150,4 +1219,6 @@ Groups are resolved at login time and cached in the token. With short-lived acce
 
     Revisit if any of these become true: a shared-workstation deployment appears; a security review requires "log out everywhere"; or an admin needs to terminate a compromised user's sessions across properties (which is the same mechanism).
 16. **Confirm the remainder of the hostname matrix.** DXKB, LDKB and MAAGE are confirmed at `dev.` + `test.` each; BV-BRC at `alpha.` + `beta.` + `dev-N.`. Still to enumerate: how many `dev-N.bv-brc.org` hosts, local-dev ports, and whether `www.` and apex are both live for each property. Every hostname is an exact-match `redirect_uri` and a CORS allowlist entry, so the list must live in explicit config, never be generated by interpolation over a property name.
-17. **Who owns client-secret rotation?** 13+ confidential BFF clients on an annual rotation is a standing operational process, not a one-off. Needs a named owner and a scripted procedure before Phase 3 puts the first ones into production.
+17. **Does Shock validate BV-BRC tokens, or only carry them?** **Shock is live** — the Workspace backing store (Robert, 2026-09-08) — so every object read and write traverses it with an `OAuth `-prefixed legacy token. It is third-party Go infrastructure and will not grow JWKS verification on request. If it validates against p3_user's `/public_key`, it is a legacy-token consumer that **Phase 6 cannot decommission around**, and the legacy signing key cannot be retired until Shock is dealt with — which would make this a critical-path dependency rather than a detail. If it only maps a token to a username for ACL purposes, the fix may be provider configuration. **Resolve before Phase 4**; see *4c-1* for the three cases and the evidence for each.
+
+18. **Who owns client-secret rotation?** 13+ confidential BFF clients on an annual rotation is a standing operational process, not a one-off. Needs a named owner and a scripted procedure before Phase 3 puts the first ones into production.
