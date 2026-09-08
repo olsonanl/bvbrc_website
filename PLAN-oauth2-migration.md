@@ -781,19 +781,26 @@ These need the same centralization treatment as Phase 0 does for the browser: on
 - **`Awe.pm` has no live caller.** Four files `use` it — `Monitor.pm:10`, `Quick.pm:16`, `scripts/codon-tree-stats.pl:7`, `service-scripts/gather-stats.pl:6` — but:
   - `Monitor.pm` is the only one that actually *instantiates* it (`:40`, `:78`, as `Awe->new($impl->{awe_server}, session('token'))`), and **`awe_server` is never populated**. `AppServiceImpl.pm` never sets the key; the only `awe-server` value in the tree is a stale `deploy.cfg` pointing at `http://redwood.mcs.anl.gov:7080`. Those calls would construct against `undef` today. `Monitor.pm` is mounted at `/monitor` in both `AppService.psgi:52` and `AppServiceAsync.psgi:53`, so it is *reachable* — which makes it dead code that is also exposed, and worth deleting on its own merits rather than porting.
   - `Quick.pm:16` `use`s `Awe` but never calls it — a leftover import.
-  - The two scripts are the same two already flagged in *4d* below as using the older `Bio::KBase::AuthToken`, and need the same live/dead determination.
+  - **`scripts/codon-tree-stats.pl` and `service-scripts/gather-stats.pl` are dead code** (Robert, 2026-09-08). They are also the two scripts flagged in *4d* as using the older `Bio::KBase::AuthToken`, so both concerns close at once.
 
 **Net effect on Phase 4c: the `OAuth` → `Bearer` work is two sites, not four — `Quick.pm:266` and `AppScript.pm:325`.** `AppScript.pm` is the one that matters; `Quick.pm` is mounted at `/quick` in both `.psgi` files and is a genuine raw-regex site (`:132`), so it stays in scope.
 
 The `Datatoken` header question is closed: **drop it.** Do not carry a non-standard token header into the JWT design.
 
-Preferred disposition for the dead modules is **delete `Awe.pm`, `AweEvents.pm`, `Shock.pm`, and `Monitor.pm`, and drop the stale `use` from `Quick.pm`** — as a separate cleanup commit, before Phase 4 rather than during it. That keeps the auth migration's diff to code that is actually live, and removes an unauthenticated-looking mounted route in the process. It is not on the OAuth2 critical path; it just shrinks it.
+Preferred disposition for the dead modules is **delete `Awe.pm`, `AweEvents.pm`, `Shock.pm`, `Monitor.pm`, the two stats scripts, and the top-level `awe` script; drop the stale `use` from `Quick.pm`** — as a separate cleanup commit, before Phase 4 rather than during it. That keeps the auth migration's diff to code that is actually live, and removes an exposed mounted route in the process. It is not on the OAuth2 critical path; it just shrinks it.
+
+**One reason to actually do the deletion rather than merely note it: `SRC_SERVICE_PERL = $(wildcard service-scripts/*.pl)` (`Makefile:25`).** Every `.pl` in that directory is built into `$(BIN_DIR)` and deployed to `$(SERVICE_DIR)/bin` with no per-file opt-in. So `gather-stats.pl` **ships on every deploy today** despite being dead, and any Phase 4 sweep that greps deployed Perl for token handling will keep finding it. Deleting the file is the only way to take it out of the build.
 
 #### 4d. Validation path
 
 `P3TokenValidator` is used in 3 files (`AsyncService.pm:28,199,239`, `AppServiceImpl.pm:94,289`, `Quick.pm:25,77`). It is the Perl analogue of `p3_api/middleware/auth.js` and needs the same dual-token treatment: scheme-prefix stripping, format detection, JWKS verification with caching, explicit `iss`/`aud` checks, and clock tolerance. Because it is already a discrete class with a `validate()` method returning `($ok, $msg)`, this is a contained change — the interface does not move.
 
-Also present: two scripts use the older `Bio::KBase::AuthToken` instead of `P3AuthToken` (`scripts/codon-tree-stats.pl:6`, `service-scripts/gather-stats.pl:5`). Determine whether these are live or dead before deciding to update them.
+**`Bio::KBase::AuthToken` — the older, pre-`P3AuthToken` module — has three consumers, and all three are dead.** They need no JWT work; they need deleting:
+
+- `scripts/codon-tree-stats.pl:6` and `service-scripts/gather-stats.pl:5` — confirmed dead (Robert, 2026-09-08)
+- **`awe`** (top-level, unlisted in *4c* above because it does not `use ...::Awe`) — an AWE operations script: connects to a local `AWEDB` MongoDB on `localhost:27017` and REST-calls `http://redwood:7080` with `Authorization: OAuth <token>` (`awe:18`). Dead by the same decision, since AWE is gone. Not referenced by the `Makefile`.
+
+That retires `Bio::KBase::AuthToken` from `app_service` entirely — worth confirming during the open-question-5 CLI survey, since if the CLI repo has no consumers either, the module itself can go.
 
 #### 4e. The CLI login command itself
 
@@ -1065,7 +1072,10 @@ Groups are resolved at login time and cached in the token. With short-lived acce
 - ~~`Shock.pm:23`, `Awe.pm:175`~~ — dead, see *4c*. AWE is out of the picture; `Shock.pm` has no `use` sites.
 
 *Dead-code cleanup (separate commit, before Phase 4):*
-- Delete `Awe.pm`, `AweEvents.pm`, `Shock.pm`, `Monitor.pm`; drop the stale `use ...::Awe` from `Quick.pm:16`
+- Delete `lib/Bio/KBase/AppService/`: `Awe.pm`, `AweEvents.pm`, `Shock.pm`, `Monitor.pm`
+- Delete `scripts/codon-tree-stats.pl`, `service-scripts/gather-stats.pl`, and the top-level `awe` script — all dead, all `Bio::KBase::AuthToken` consumers. **`gather-stats.pl` deploys today** via `Makefile:25`'s `$(wildcard service-scripts/*.pl)`; deletion is the only opt-out.
+- Delete `make-log-events-data.pl` (declares `package ...::AweEvents`)
+- Drop the stale `use ...::Awe` from `Quick.pm:16`
 - Unmount `/monitor` from `lib/AppService.psgi:52` and `lib/AppServiceAsync.psgi:53`
 - Remove the stale `awe-server` entries from `deploy.cfg:4,26`
 
@@ -1093,9 +1103,9 @@ Groups are resolved at login time and cached in the token. With short-lived acce
 2. **Idle session policy** — preserve today's "logged out unless mouse active" behavior, or move to refresh-token-window semantics? These give noticeably different UX for long-running analysis sessions.
 3. **Impersonation re-auth** — is `prompt=login` acceptable to admins, or is the current password re-prompt preferred for familiarity?
 4. ~~**Where do `P3AuthToken.pm` and `P3TokenValidator.pm` live?**~~ **Resolved:** `git@github.com:olsonanl/p3_auth`, vendored at `dev_container/modules/p3_auth/lib/`. Both read and inventoried — see *4a-0* above. The shim strategy is confirmed viable. Remaining sub-question: who owns `p3_auth` releases, and how does a change there propagate to the deployed CLI and to `app_service`?
-5. **Perl CLI repo inventory** — the `p3-*` command distribution has not been surveyed at all. Run the same `un=` / `SigningSubject` / `tokenid` / `split(/\|/)` / `P3AuthToken` grep there.
+5. **Perl CLI repo inventory** — the `p3-*` command distribution has not been surveyed at all. Run the same `un=` / `SigningSubject` / `tokenid` / `split(/\|/)` / `P3AuthToken` grep there. **Add `Bio::KBase::AuthToken` to that grep**: its three `app_service` consumers are all dead, so if the CLI repo has none either, the module can be retired outright rather than taught JWTs.
 6. **Non-interactive Perl callers** — `ignore_authrc => 1` and `KB_INTERACTIVE` imply scripted users who cannot complete a device flow. Enumerate them and decide their migration path (Client Credentials? provisioned credential?) before Phase 6 removes legacy tokens.
-7. ~~**`Awe.pm`'s `Datatoken` header** — is AWE still in the request path?~~ **Resolved** (Robert, 2026-09-08): AWE is no longer in the picture. Drop the `Datatoken` header; `Awe.pm` and `Shock.pm` are dead and leave Phase 4c with two `OAuth`-scheme sites instead of four. See *4c* for the verification and the proposed cleanup commit. Remaining sub-question: `codon-tree-stats.pl` and `gather-stats.pl` still `use` `Awe` *and* the older `Bio::KBase::AuthToken` — they are the same live/dead determination as open question 5's CLI survey, so settle both together.
+7. ~~**`Awe.pm`'s `Datatoken` header** — is AWE still in the request path?~~ **Resolved** (Robert, 2026-09-08): AWE is no longer in the picture. Drop the `Datatoken` header; `Awe.pm` and `Shock.pm` are dead and leave Phase 4c with two `OAuth`-scheme sites instead of four. `codon-tree-stats.pl`, `gather-stats.pl`, and the top-level `awe` script are **also dead** (Robert, 2026-09-08), which retires `Bio::KBase::AuthToken` from `app_service` entirely. See *4c*/*4d* for the verification and the cleanup commit. Note `gather-stats.pl` currently **deploys** via the `service-scripts/*.pl` wildcard in `Makefile:25`, so it must actually be deleted, not just ignored. Nothing further outstanding here beyond confirming during the open-question-5 CLI survey that `Bio::KBase::AuthToken` has no consumers there either — if not, the module itself can go.
 8. **`TaskToken` migration strategy** — confirm the dual-column approach for in-flight jobs is acceptable to operations, and who owns the schema change.
 9. **Workspace/app service `Bearer` support** — does it exist already, or is it work? Blocks Phase 0's server-side counterpart.
 10. **Are there non-browser, non-CLI legacy token consumers** (external collaborators, cron jobs) that would need notice before Phase 6? The Phase 2 metrics should answer this empirically.
