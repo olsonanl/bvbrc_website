@@ -486,13 +486,27 @@ Proposed refactor (mechanical, no behavior change, ships on its own branch):
 // scheme: 'api'   -> bare token. p3_api, p3_user, Workspace RPC, app service RPC.
 //                    This is the default and covers ~287 of the ~294 sites.
 // scheme: 'oauth' -> 'OAuth ' prefix. Shock node URLs only (+ app service /task_info).
-function authHeader(scheme) { ... }
+// token:  optional explicit token; falls back to the ambient one when omitted.
+function authHeader(scheme, token) { ... }
 ```
 
 - Replace `Authorization: (window.App.authorizationToken || '')` with `authHeader('api')`
 - Replace `'OAuth ' + window.App.authorizationToken` / `'Oauth ' + ...` with `authHeader('oauth')`
-- `WorkflowManager.js:22` already has a local `getAuthHeader()` — fold it in
+- `WorkflowManager.js:22` already has a local `getAuthHeader()` — fold it in. Note it falls back to `localStorage.getItem('tokenstring')` when `window.App.authorizationToken` is unset; the shared helper should adopt that fallback rather than drop it.
 - `jsonrpc.js:11` and `SEEDClient.js:137` take the token as a parameter; route those through the helper too
+
+**The helper needs an optional explicit-token argument, not just a scheme.** A pattern census of the 292 client sites (2026-09-08) found ~36 of them are not plain header construction but *token override*:
+
+```
+ 27  Authorization: _self.token ? _self.token : (window.App.authorizationToken || '')
+  4  Authorization': this.token ? this.token : (window.App.authorizationToken || "")
+  3  Authorization: this.token  ? this.token : (window.App.authorizationToken || '')
+  2  Authorization': _self.token ? _self.token : (window.App.authorizationToken || "")
+```
+
+plus three sites that receive a token purely by parameter (`GenomeList.js:61`, `GenomeGroup.js:56`, `p3app.js:807`) and the two already noted (`jsonrpc.js:11`, `SEEDClient.js:137`). A one-argument `authHeader(scheme)` that only reads the global would silently discard the per-store/per-widget token on all of these — a real behavior change in exactly the Phase 0 refactor that is supposed to have none. Signature: `authHeader(scheme, token)`, where an omitted `token` means "use the ambient one."
+
+Remaining distribution, for sizing: 198 sites are the single canonical spelling `Authorization: (window.App.authorizationToken || '')`, and another ~30 are trivial spelling variants of it (quoted key, no `|| ''`, `"` vs `'`). So roughly 230 of 292 are a literal find-and-replace, ~36 need the two-argument form, 4 are the `OAuth`/`Oauth` sites, and the rest are one-offs. The 292 are spread across **138 files**.
 
 **Name the `'oauth'` scheme after Shock, not after a service tier.** The survey in *4c-1* found the discriminator is not "workspace/app service vs. API" — both of those speak bare tokens on their RPC paths. It is Shock (plus the one `/task_info` mount). A helper documented the old way invites a future caller to reach for `authHeader('oauth')` when adding a Workspace call, which fails signature verification server-side with a misleading error.
 
@@ -645,11 +659,18 @@ JWT verification uses JWKS from `https://auth.bv-brc.org/.well-known/openid-conf
 ## Phased Migration
 
 ### Phase 0: Centralize the Authorization header (prerequisite)
-- Introduce `public/js/p3/auth/authHeaders.js`; convert all ~294 inline `Authorization` sites to it, preserving the existing per-destination scheme (**bare for p3_api, p3_user, Workspace RPC and app service RPC; `OAuth ` for Shock only** — see *4c-1*)
-- Fold in `WorkflowManager.js`'s local `getAuthHeader()`, plus the token-parameter cases in `jsonrpc.js` and `SEEDClient.js`
+Phase 0 splits cleanly into two independent branches. **0a is unblocked and can start now; 0b is gated on open question #13.**
+
+**Phase 0a — the header refactor (no open questions remain):**
+- Introduce `public/js/p3/auth/authHeaders.js` with signature `authHeader(scheme, token)`; convert all ~294 inline `Authorization` sites (across 138 files) to it, preserving the existing per-destination scheme (**bare for p3_api, p3_user, Workspace RPC and app service RPC; `OAuth ` for Shock only** — see *4c-1*)
+- The optional `token` argument is required by the ~36 `this.token ? this.token : <ambient>` override sites; omitting it would be a silent behavior change
+- Fold in `WorkflowManager.js`'s local `getAuthHeader()` (preserving its `localStorage.tokenstring` fallback), plus the token-parameter cases in `jsonrpc.js`, `SEEDClient.js`, `GenomeList.js:61`, `GenomeGroup.js:56`, `p3app.js:807`
 - ~~Confirm workspace and app services accept `Bearer`~~ — **surveyed: they do not, and neither strips any scheme prefix.** Adding `Bearer` support is Phase 4 work in `P3TokenValidator`/`P3AuthToken`, not a Phase 0 confirmation step.
+- Write the new module to be **portable to the sibling property codebases** — self-contained, config-driven, no hardcoded origins
+
+**Phase 0b — CORS (do not start until #13 is answered):**
+- Determine whether the three `withCredentials: true` call sites — `public/js/p3/app/app.js:638`, `widget/UserProfileEditor.js:38`, `widget/suLoginForm.js:26` — depend on cross-origin credentialed requests, or are same-origin in production
 - **Fix the broken CORS configuration** in `p3_api/app.js:129` and `p3_user/app.js:79` — the `credential`/`allowHeaders` misspellings, but **only together with an explicit origin allowlist**, never the spelling alone (see *Multi-Domain Rollout and CORS*). The allowlist is the same property list the `redirect_uri` registration needs, so the two should be derived from one config source.
-- Determine whether the three `withCredentials: true` call sites depend on cross-origin credentialed requests, or are same-origin in production
 - Write the new modules to be **portable to the sibling property codebases** — self-contained, config-driven, no hardcoded origins
 - **Delivers:** no behavior change, but Phase 3 becomes a one-file edit instead of a 294-site edit, and the CORS posture stops being accidental. Ships independently on its own branch, reviewable in isolation.
 
