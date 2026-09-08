@@ -446,9 +446,30 @@ Consequences today:
 
 - **`Access-Control-Allow-Credentials` is never sent** by either service.
 - `allowedHeaders` being unset means the library **reflects `Access-Control-Request-Headers`**, which is why `authorization` works cross-origin at all. It works by accident, not by configuration.
-- Three call sites set `withCredentials: true` (`app/app.js:638`, `UserProfileEditor.js:38`, `suLoginForm.js:26`). Without the ACAC response header the browser discards those responses — so either these are same-origin in production (likely, given `dataServiceURL`/`workspaceServiceURL` are relative paths) or the code path is quietly broken. **Determine which before the migration**, because the answer tells us whether anything actually depends on credentialed cross-origin requests.
+- Three call sites set `withCredentials: true` (`app/app.js:638`, `UserProfileEditor.js:38`, `suLoginForm.js:26`).
 
-**Do not simply correct the spelling.** `origin: true` reflects *any* requesting origin. Combined with a working `credentials: true`, that would let any website on the internet make credentialed requests to p3_api with a victim's ambient authority. The correct sequence is: **introduce an explicit origin allowlist first, then fix the spelling, in the same change.** Note that the allowlist is exactly the set of properties enumerated for this rollout — the same list the `redirect_uri` registration needs.
+**Resolved (Robert, 2026-09-08): all three are same-origin in production, and that is not a coincidence — the data API and the other site-facing endpoints were deliberately arranged to live under the same domain as the site, most likely *because* of this latent bug.** Verified in the code: every one of the three resolves to a same-origin path.
+
+| Site | Request | Resolves to |
+|---|---|---|
+| `app/app.js:638` | `xhr.get(this.apiServer + href)` | `apiServer` = `dataServiceURL` = `/alpha/api` (relative; `/api` in the sample conf) |
+| `widget/UserProfileEditor.js:38` | `xhr.post('/user/')` | served by `bvbrc_website` itself — `app.js:268` mounts `/user` on `contentViewer` |
+| `widget/suLoginForm.js:26` | `xhr.post('/sulogin')` | same — `app.js:269` mounts `/sulogin` on `contentViewer` |
+
+So `withCredentials: true` is inert on all three: same-origin requests carry cookies regardless, and no ACAC header is required. **Nothing depends on credentialed cross-origin requests today.**
+
+This is a load-bearing fact rather than a footnote, and it cuts in two directions:
+
+**It de-risks the CORS fix.** There is no working behavior to preserve. The allowlist can be tight from day one, and the three `withCredentials: true` flags can simply be deleted as part of the change — they document an intent the deployment does not use.
+
+**It creates a constraint the migration must not silently violate.** The same-domain arrangement is a *workaround*, and workarounds erode when the people who remember them move on. Two live pressures:
+
+- **`accountURL` / `authorizationURL` / `userServiceURL` still point at `https://user.patricbrc.org`** — a genuinely different origin, and one this migration replaces. `auth.bv-brc.org` will be cross-origin to `bv-brc.org` by design.
+- **The multi-property rollout (`bv-brc.org`, `maage.bv-brc.org`, `dxkb.*`, `ldkb.*`) breaks the same-domain premise wherever a property is not a subdomain of the API's registrable domain.** DXKB and LDKB are the ones to check.
+
+The BFF design already absorbs most of this: the browser talks only to its own origin, and the BFF makes the cross-origin calls server-side, where CORS does not apply. **That is now a hard requirement, not a preference.** Any design that has the browser call p3_api or p3_oidc cross-origin with credentials re-opens exactly the gap the same-domain arrangement papers over, and would need the CORS fix to be genuinely correct first.
+
+**Do not simply correct the spelling.** `origin: true` reflects *any* requesting origin. Combined with a working `credentials: true`, that would let any website on the internet make credentialed requests to p3_api with a victim's ambient authority — and because the same-domain arrangement means nothing currently exercises the cross-origin path, the regression would be invisible in testing. The correct sequence is: **introduce an explicit origin allowlist first, then fix the spelling, in the same change.** Note that the allowlist is exactly the set of properties enumerated for this rollout — the same list the `redirect_uri` registration needs.
 
 Also relevant: p3_api sets `Content-Security-Policy` (`app.js:125`) but neither service sets CORS-adjacent hardening headers on the auth surface. `auth.bv-brc.org` should send a restrictive CSP of its own, and **should not enable CORS at all** — nothing legitimately fetches it from a browser under this design. An OIDC provider with permissive CORS is a liability, not a feature.
 
@@ -668,9 +689,11 @@ Phase 0 splits cleanly into two independent branches. **0a is unblocked and can 
 - ~~Confirm workspace and app services accept `Bearer`~~ — **surveyed: they do not, and neither strips any scheme prefix.** Adding `Bearer` support is Phase 4 work in `P3TokenValidator`/`P3AuthToken`, not a Phase 0 confirmation step.
 - Write the new module to be **portable to the sibling property codebases** — self-contained, config-driven, no hardcoded origins
 
-**Phase 0b — CORS (do not start until #13 is answered):**
-- Determine whether the three `withCredentials: true` call sites — `public/js/p3/app/app.js:638`, `widget/UserProfileEditor.js:38`, `widget/suLoginForm.js:26` — depend on cross-origin credentialed requests, or are same-origin in production
-- **Fix the broken CORS configuration** in `p3_api/app.js:129` and `p3_user/app.js:79` — the `credential`/`allowHeaders` misspellings, but **only together with an explicit origin allowlist**, never the spelling alone (see *Multi-Domain Rollout and CORS*). The allowlist is the same property list the `redirect_uri` registration needs, so the two should be derived from one config source.
+**Phase 0b — CORS (also unblocked; #13 resolved):**
+- ~~Determine whether the three `withCredentials: true` call sites depend on cross-origin credentialed requests~~ — **they do not; all three are same-origin in production** (`app/app.js:638` via the relative `dataServiceURL`; `/user/` and `/sulogin` mounted by `bvbrc_website` at `app.js:268-269`). Nothing depends on credentialed cross-origin requests.
+- **Delete the three `withCredentials: true` flags.** They are inert and they misdescribe the deployment.
+- **Fix the broken CORS configuration** in `p3_api/app.js:129` and `p3_user/app.js:79` — the `credential`/`allowHeaders` misspellings, but **only together with an explicit origin allowlist**, never the spelling alone (see *Multi-Domain Rollout and CORS*). The allowlist is the same property list the `redirect_uri` registration needs, so the two should be derived from one config source. Since nothing exercises the cross-origin path today, a spelling-only fix would open `origin: true` + working credentials with no test failing to show it.
+- Confirm whether DXKB and LDKB are subdomains of the API's registrable domain. If not, they cannot inherit the same-domain workaround and their BFF is the only thing standing between them and this CORS config.
 - Write the new modules to be **portable to the sibling property codebases** — self-contained, config-driven, no hardcoded origins
 - **Delivers:** no behavior change, but Phase 3 becomes a one-file edit instead of a 294-site edit, and the CORS posture stops being accidental. Ships independently on its own branch, reviewable in isolation.
 
@@ -1201,7 +1224,7 @@ Groups are resolved at login time and cached in the token. With short-lived acce
 10. **Are there non-browser, non-CLI legacy token consumers** (external collaborators, cron jobs) that would need notice before Phase 6? The Phase 2 metrics should answer this empirically.
 11. **Separate non-production IdP (`auth-dev.bv-brc.org`) or shared?** Recommended separate — the only way to rehearse key rotation, secret rotation, and p3_oidc upgrades without touching production auth. One shared non-production instance serves every property's dev/alpha/beta tier, so it is two IdP deployments total, not five. Decide before Phase 1, since it doubles what Phase 1 builds. If separate: shared `users` collection with distinct `oidc_*` collections, or full isolation?
 12. ~~**What are DXKB and LDKB, exactly?**~~ **Resolved** (Robert, 2026-09-08): DXKB runs the same codebase as BV-BRC today but moves to a **new React site in 9–12 months**; LDKB is **greenfield, probably React**. So the Dojo port target is MAAGE plus DXKB-in-the-interim — see the reframing above. The **BFF endpoint contract, written down as a normative spec, is the artifact the React sites consume**; the Dojo modules are not portable to them. Remaining sub-question: does the DXKB React rewrite land before or after Phase 3? If after, DXKB needs the Dojo port and then discards it — in which case consider deferring DXKB's port entirely and letting the rewrite pick up OIDC natively, rather than paying for it twice.
-13. **Do the three `withCredentials: true` call sites matter?** They cannot work cross-origin today (no `Access-Control-Allow-Credentials` is ever sent, due to the `credential` typo). Are they same-origin in production, or quietly broken? Answer before changing the CORS config.
+13. ~~**Do the three `withCredentials: true` call sites matter?**~~ **Resolved** (Robert, 2026-09-08): **no — all three are same-origin in production**, and the data API and other site-facing endpoints were deliberately placed under the site's own domain, probably *because* of this latent bug. Verified in code: `app/app.js:638` uses the relative `dataServiceURL`, and `/user/` and `/sulogin` are mounted by `bvbrc_website` itself (`app.js:268-269`). So `withCredentials: true` is inert on all three and nothing depends on credentialed cross-origin requests. **Phase 0b is unblocked**; the flags can be deleted with the CORS fix. The follow-on constraint is recorded above: the same-domain arrangement is a workaround, and the BFF must keep the browser talking only to its own origin so the migration does not quietly re-open the gap it papers over. Remaining sub-question, now a rollout item rather than a blocker: **are DXKB and LDKB subdomains of the API's registrable domain?** If not, they cannot inherit the workaround.
 14. ~~**ViPR realm disposition**~~ **Resolved** (Robert, 2026-09-08): **no new `viprbrc.org` credentials will be created** — it was a transitory realm for the IRD/ViPR integration. Therefore: no upstream-IdP connector, and `LoginForm.js:76-93` / `loginWithVipr()` are removal targets. No longer blocks Phase 3b. Remaining sub-question: how many `@viprbrc.org` accounts exist, and do they keep `@viprbrc.org` in `sub` (recommended — see above) or get migrated to `@bvbrc`? Must be settled before Phase 3a retires the legacy login form.
 15. **Single logout across properties** — **Decided for now** (Robert, 2026-09-08): **per-site logout is acceptable.** Recorded here with the options and their implications, since this is a design the initial build must not foreclose.
 
