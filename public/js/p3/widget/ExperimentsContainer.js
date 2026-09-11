@@ -2,13 +2,13 @@ define([
   'dojo/_base/declare', 'dijit/layout/BorderContainer', 'dojo/on',
   './ActionBar', './FilterContainerActionBar', 'dijit/layout/StackContainer', 'dijit/layout/TabController',
   'dijit/layout/ContentPane', './ExperimentGridContainer', 'dojo/topic', 'dojo/_base/lang',
-  './BiosetGridContainer', 'dojo/request', '../util/PathJoin'
+  './BiosetGridContainer', 'dojo/request', '../util/PathJoin', '../auth/authHeaders'
 ], function (
   declare, BorderContainer, on,
   ActionBar, FilterContainerActionBar, TabContainer, StackController,
   ContentPane, ExperimentGridContainer, Topic, lang,
-  BiosetGridContainer, xhr, PathJoin
-) {
+  BiosetGridContainer, xhr, PathJoin,
+  authHeader) {
 
   return declare([BorderContainer], {
     gutters: false,
@@ -28,7 +28,7 @@ define([
           accept: 'application/json',
           'content-type': 'application/rqlquery+x-www-form-urlencoded',
           'X-Requested-With': null,
-          Authorization: (window.App.authorizationToken || '')
+          Authorization: authHeader()
         },
         data: query,
         handleAs: 'json'
