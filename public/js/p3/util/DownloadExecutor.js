@@ -43,9 +43,19 @@ define([
     ? window.App.dataServiceURL
     : '/api/data';
 
-  var BUNDLER_API_URL = window.App && window.App.dataServiceURL
-    ? window.App.dataServiceURL.replace('/data', '/bundle')
-    : '/api/bundle';
+  // The bundle endpoint is mounted at <apiRoot>/bundle/<dataType>/
+  // (p3_api app.js: `app.use('/bundle/:dataType/', [downloadRouter])`).
+  //
+  // This was `dataServiceURL.replace('/data', '/bundle')`, which only rewrites
+  // anything when the configured URL contains a literal '/data' -- and none of
+  // them do: 'https://alpha.bv-brc.org/api', '/alpha/api' and the production
+  // URL all pass through unchanged. The bundle request therefore went to
+  // <apiRoot>/genome/, the ordinary data-type route, which tries to parse a
+  // JSON bundle body as an RQL query and never responds (measured: no reply at
+  // 60s, versus a prompt 400 from the real endpoint).
+  var BUNDLER_API_URL = (window.App && window.App.dataServiceURL
+    ? window.App.dataServiceURL.replace(/\/+$/, '')
+    : '/api') + '/bundle';
 
   // Maximum records for client-side download
   var CLIENT_SIDE_LIMIT = 25000;
@@ -478,7 +488,24 @@ define([
       spec: spec
     });
 
-    xhr.post(BUNDLER_API_URL + '/genome/', {
+    // NOTE: this request is still wrong in two further ways, left as-is because
+    // the path is unreachable today (no format declares category 'package' or
+    // type 'bundle', so bundleConfig is never set) and guessing at the right
+    // shape without a caller to test is how the URL bug above survived.
+    // Measured against the real endpoint, it wants:
+    //   - Content-Type: application/x-www-form-urlencoded, not JSON. The server
+    //     mounts BodyParser.urlencoded (p3_api routes/download.js:126), so a
+    //     JSON body leaves req.body.types undefined -> 400 "Missing Bundled Types".
+    //   - `types` as a comma-joined STRING, not an array: the server does
+    //     `req.body.types.split(',')` (download.js:130).
+    //   - values from the server's whitelist (download.js ALLOWED_BUNDLE_TYPES,
+    //     e.g. '.gff', '.features.tab') or it answers 400 "Invalid bundle type".
+    // With all three right the endpoint returns a zip directly -- there is no
+    // job id or downloadUrl in the response, so the .then() below is also
+    // modelled on an API that does not exist. Verified:
+    //   POST <api>/bundle/genome/  types=.gff&query=eq(genome_id,83332.12)
+    //   -> 200 application/zip
+    xhr.post(BUNDLER_API_URL + '/' + spec.dataType + '/', {
       data: JSON.stringify(bundleRequest),
       headers: requestHeaders,
       handleAs: 'json',
