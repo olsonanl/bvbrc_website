@@ -8,7 +8,8 @@ define([
   'dojo/when',
   './WizardStepBase',
   'dojo/text!./templates/RecordSelectorStep.html',
-  '../../util/DownloadFormats'
+  '../../util/DownloadFormats',
+  '../../util/joinTooBroad', '../JoinTooBroadMessage'
 ], function (
   declare,
   lang,
@@ -19,7 +20,8 @@ define([
   when,
   WizardStepBase,
   template,
-  DownloadFormats
+  DownloadFormats,
+  joinTooBroad, JoinTooBroadMessage
 ) {
   /**
    * RecordSelectorStep - Step 2: Select which records to download
@@ -191,6 +193,17 @@ define([
             }
           },
           function (err) {
+            // A genome(...) filter the API refuses as too broad fails HERE, on the
+            // cheap count query, ~1.5s before the user commits to a download. The
+            // download itself would NOT be refused -- downloads are exempt from the
+            // join guard (p3_api middleware/JoinResolution.js:100) on the reasoning
+            // that "slow but reliable beats refused" -- so it would instead run until
+            // something times out, with no indication it was doomed. Catching it here
+            // turns a silent multi-minute hang into an explanation plus a way out.
+            if (joinTooBroad.isJoinTooBroad(err)) {
+              self._showJoinTooBroad(err);
+              return;
+            }
             console.warn('Failed to fetch record count:', err);
             if (self.allCountNode) {
               var countSpan = self.allCountNode.querySelector('.countValue');
@@ -257,11 +270,87 @@ define([
     /**
      * Validate the step
      */
+    /**
+     * Render the API's join_too_broad rejection into the step, with the taxon
+     * drill-down, and block the Download button for 'all' scope.
+     *
+     * Built with domConstruct rather than WizardStepBase.showError(), which
+     * assigns innerHTML -- the taxon names here come from the API and a name
+     * containing markup would be parsed rather than shown.
+     */
+    _showJoinTooBroad: function (err) {
+      this._joinTooBroadInfo = joinTooBroad.parse(err);
+      this._lastJoinError = err;
+
+      if (this.allCountNode) {
+        var countSpan = this.allCountNode.querySelector('.countValue');
+        if (countSpan) {
+          countSpan.textContent = 'too many';
+        }
+      }
+
+      if (!this.errorNode) { return; }
+      domConstruct.empty(this.errorNode);
+      domClass.remove(this.errorNode, 'dijitHidden');
+
+      if (!this._joinTooBroadMessage) {
+        this._joinTooBroadMessage = new JoinTooBroadMessage();
+      }
+      // Reuses the same widget the grid shows, so the explanation and the
+      // drill-down links a user already saw behind this dialog are consistent.
+      this._joinTooBroadMessage.render(this.errorNode, err, {
+        apiServer: window.App && window.App.dataServiceURL
+      });
+
+      // 'selected' scope sends in(pk,(ids)) with no join, so it still works --
+      // only 'all' inherits the offending filter. validate() is what actually
+      // blocks the button; nothing further is needed here.
+    },
+
+    /**
+     * The wizard calls showError(message) with the string from validate(), and
+     * the base implementation assigns it as innerHTML -- which would replace the
+     * drill-down links with plain text on the first Download click. When the
+     * join_too_broad message is already on screen it says the same thing and
+     * more, so keep it.
+     */
+    showError: function (message) {
+      if (this._joinTooBroadInfo && this.errorNode
+          && this.errorNode.querySelector('.JoinTooBroad')) {
+        domClass.remove(this.errorNode, 'dijitHidden');
+        return;
+      }
+      this.inherited(arguments);
+    },
+
+    clearError: function () {
+      // Deliberately does NOT drop _joinTooBroadInfo. _selectScope() calls this
+      // on every scope change, and the filter is still too broad whichever
+      // scope is selected -- it just does not matter for 'selected', which
+      // queries by explicit ids. Dropping it here would lose the warning when
+      // the user switched to 'selected' and back.
+      this.inherited(arguments);
+      if (this._joinTooBroadInfo && this.selectedScope === 'all' && this._lastJoinError) {
+        this._showJoinTooBroad(this._lastJoinError);
+      }
+    },
+
     validate: function () {
       if (this.selectedScope === 'selected' && this.selectionCount === 0) {
         return {
           valid: false,
           message: 'No records are selected. Please select records or choose "All records".'
+        };
+      }
+
+      // Block 'all' when the API already refused to count it: the download
+      // would be accepted and then run until it timed out. 'selected' is
+      // unaffected -- it queries by explicit ids, without the join.
+      if (this.selectedScope === 'all' && this._joinTooBroadInfo) {
+        return {
+          valid: false,
+          message: joinTooBroad.describe(this._joinTooBroadInfo)
+            + ' Narrow the filter, or choose specific records to download.'
         };
       }
 
