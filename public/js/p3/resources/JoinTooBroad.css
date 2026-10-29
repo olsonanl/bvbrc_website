@@ -93,3 +93,17 @@
   border: 1px solid #e3c14e;
   border-radius: 3px;
 }
+
+/* Download wizard: the API could not count this selection up front (a batched
+   join computes no numFound). Informational -- the download still runs -- so
+   styled as a note rather than the amber "something is wrong" of the others. */
+.recordSelectorStep .countNote {
+  margin: 8px 0 4px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #41494f;
+  background-color: #f4f8fb;
+  border: 1px solid #c8d8e4;
+  border-radius: 3px;
+}

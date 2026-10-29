@@ -9,7 +9,7 @@ define([
   './WizardStepBase',
   'dojo/text!./templates/RecordSelectorStep.html',
   '../../util/DownloadFormats',
-  '../../util/joinTooBroad', '../JoinTooBroadMessage'
+  '../../util/joinTooBroad'
 ], function (
   declare,
   lang,
@@ -21,7 +21,7 @@ define([
   WizardStepBase,
   template,
   DownloadFormats,
-  joinTooBroad, JoinTooBroadMessage
+  joinTooBroad
 ) {
   /**
    * RecordSelectorStep - Step 2: Select which records to download
@@ -193,15 +193,18 @@ define([
             }
           },
           function (err) {
-            // A genome(...) filter the API refuses as too broad fails HERE, on the
-            // cheap count query, ~1.5s before the user commits to a download. The
-            // download itself would NOT be refused -- downloads are exempt from the
-            // join guard (p3_api middleware/JoinResolution.js:100) on the reasoning
-            // that "slow but reliable beats refused" -- so it would instead run until
-            // something times out, with no indication it was doomed. Catching it here
-            // turns a silent multi-minute hang into an explanation plus a way out.
+            // The count query uses a grid-shaped request, so a too-broad genome(...)
+            // filter is refused here (400 in ~1.5s) even though the DOWNLOAD of the
+            // same filter succeeds: BV-BRC-API#245 lets a bulk download resolve the
+            // join in bounded slices instead of refusing it. Measured on alpha, same
+            // Viruses filter: count query 400, download 200 with real CSV in ~4s.
+            //
+            // So this is NOT a reason to block the download. Per
+            // Docs/CLIENT-join-too-broad.md: "If the UI offers 'download these
+            // results' next to a too-broad grid, the download is worth offering even
+            // when the grid is refused." We only lose the row count.
             if (joinTooBroad.isJoinTooBroad(err)) {
-              self._showJoinTooBroad(err);
+              self._noteCountUnavailable(err);
               return;
             }
             console.warn('Failed to fetch record count:', err);
@@ -271,68 +274,37 @@ define([
      * Validate the step
      */
     /**
-     * Render the API's join_too_broad rejection into the step, with the taxon
-     * drill-down, and block the Download button for 'all' scope.
+     * The count query was refused as too broad. Note it and move on.
      *
-     * Built with domConstruct rather than WizardStepBase.showError(), which
-     * assigns innerHTML -- the taxon names here come from the API and a name
-     * containing markup would be parsed rather than shown.
+     * Deliberately does NOT block the download or offer the taxon drill-down the
+     * grid shows. The download path resolves this join in slices (BV-BRC-API#245)
+     * and completes, so refusing it here would deny the user a download the server
+     * is willing to produce -- the exact case the API contract calls out.
+     *
+     * What is genuinely lost is the count: `numFound` is never computed for a
+     * batched join, so we cannot say how many records this will be.
      */
-    _showJoinTooBroad: function (err) {
+    _noteCountUnavailable: function (err) {
       this._joinTooBroadInfo = joinTooBroad.parse(err);
-      this._lastJoinError = err;
 
       if (this.allCountNode) {
         var countSpan = this.allCountNode.querySelector('.countValue');
         if (countSpan) {
-          countSpan.textContent = 'too many';
+          countSpan.textContent = 'All matching';
         }
       }
 
-      if (!this.errorNode) { return; }
-      domConstruct.empty(this.errorNode);
-      domClass.remove(this.errorNode, 'dijitHidden');
-
-      if (!this._joinTooBroadMessage) {
-        this._joinTooBroadMessage = new JoinTooBroadMessage();
-      }
-      // Reuses the same widget the grid shows, so the explanation and the
-      // drill-down links a user already saw behind this dialog are consistent.
-      this._joinTooBroadMessage.render(this.errorNode, err, {
-        apiServer: window.App && window.App.dataServiceURL
-      });
-
-      // 'selected' scope sends in(pk,(ids)) with no join, so it still works --
-      // only 'all' inherits the offending filter. validate() is what actually
-      // blocks the button; nothing further is needed here.
-    },
-
-    /**
-     * The wizard calls showError(message) with the string from validate(), and
-     * the base implementation assigns it as innerHTML -- which would replace the
-     * drill-down links with plain text on the first Download click. When the
-     * join_too_broad message is already on screen it says the same thing and
-     * more, so keep it.
-     */
-    showError: function (message) {
-      if (this._joinTooBroadInfo && this.errorNode
-          && this.errorNode.querySelector('.JoinTooBroad')) {
-        domClass.remove(this.errorNode, 'dijitHidden');
-        return;
-      }
-      this.inherited(arguments);
-    },
-
-    clearError: function () {
-      // Deliberately does NOT drop _joinTooBroadInfo. _selectScope() calls this
-      // on every scope change, and the filter is still too broad whichever
-      // scope is selected -- it just does not matter for 'selected', which
-      // queries by explicit ids. Dropping it here would lose the warning when
-      // the user switched to 'selected' and back.
-      this.inherited(arguments);
-      if (this._joinTooBroadInfo && this.selectedScope === 'all' && this._lastJoinError) {
-        this._showJoinTooBroad(this._lastJoinError);
-      }
+      if (!this.countNoteNode) { return; }
+      domConstruct.empty(this.countNoteNode);
+      domClass.remove(this.countNoteNode, 'dijitHidden');
+      // Plain text node: the count and limit come from the API.
+      this.countNoteNode.appendChild(document.createTextNode(
+        'This selection is too large to count up front'
+        + (this._joinTooBroadInfo && this._joinTooBroadInfo.genomeCount
+          ? ' (' + joinTooBroad.formatCount(this._joinTooBroadInfo.genomeCount) + ' genomes)'
+          : '')
+        + '. The download will still run, but may take several minutes.'
+      ));
     },
 
     validate: function () {
@@ -343,16 +315,9 @@ define([
         };
       }
 
-      // Block 'all' when the API already refused to count it: the download
-      // would be accepted and then run until it timed out. 'selected' is
-      // unaffected -- it queries by explicit ids, without the join.
-      if (this.selectedScope === 'all' && this._joinTooBroadInfo) {
-        return {
-          valid: false,
-          message: joinTooBroad.describe(this._joinTooBroadInfo)
-            + ' Narrow the filter, or choose specific records to download.'
-        };
-      }
+      // NOTE: a too-broad genome(...) filter is deliberately NOT blocked here.
+      // The count query is refused but the download is not -- see
+      // _noteCountUnavailable and BV-BRC-API#245.
 
       return true;
     },

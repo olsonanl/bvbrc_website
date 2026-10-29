@@ -5,6 +5,10 @@
   </div>
 
   <div class="errorMessage dijitHidden" data-dojo-attach-point="errorNode"></div>
+  <!-- Informational, not an error: the API could not count this selection up
+       front, but the download will still run. See RecordSelectorStep
+       _noteCountUnavailable. -->
+  <div class="countNote dijitHidden" data-dojo-attach-point="countNoteNode"></div>
   <div class="loadingIndicator dijitHidden" data-dojo-attach-point="loadingNode">
     <i class="icon-spinner fa-spin"></i> Loading record counts...
   </div>
