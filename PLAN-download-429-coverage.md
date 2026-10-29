@@ -75,14 +75,55 @@ three of the four sites — the provider matches on data-API URLs and wraps them
 
 Two caveats that are not optional:
 
-- **Line 477 posts to `BUNDLER_API_URL`, not the data API.** Check whether the provider's
-  matcher covers it; if the bundler is a different host/prefix it will fall through
-  unwrapped, which is correct (it is a job-submission call, not a Solr query) but should be
-  a deliberate decision rather than an accident.
 - **The timeouts interact with retry.** A 300 s timeout wrapping 3 retries at up to ~10 s
   backoff each is fine, but `retryRequest` does not currently subtract elapsed time from
   the caller's timeout. Worth confirming a shed-then-retried download still has budget left
-  rather than failing on a timeout that was consumed by waiting.
+  rather than failing on a timeout that was consumed by waiting. This matters much more in
+  `unattended` mode (Item 3), where a single backoff can reach 300 s.
+- **Line 477's `BUNDLER_API_URL` is broken independently of 429 work.** See Item 1a.
+
+### Item 1a — the bundler URL is computed wrong (latent bug, found while checking the matcher)
+
+```javascript
+var BUNDLER_API_URL = window.App && window.App.dataServiceURL
+  ? window.App.dataServiceURL.replace('/data', '/bundle')
+  : '/api/bundle';
+```
+
+The `.replace('/data', '/bundle')` only fires if the configured URL contains the literal
+`/data`. It does not in any real deployment:
+
+| configured `dataServiceURL` | result |
+|---|---|
+| `https://alpha.bv-brc.org/api` | unchanged — **no-op** |
+| `/alpha/api` | unchanged — **no-op** |
+| `https://www.bv-brc.org/api` | unchanged — **no-op** |
+| `/api/data` (the hardcoded fallback's shape) | `/api/bundle` ✓ |
+
+So `executeBundleDownload` POSTs its JSON bundle request to `<apiRoot>/genome/` — the
+ordinary data-type route — instead of `<apiRoot>/bundle/genome/`. Verified against alpha:
+
+```
+POST /api/genome/        {"genome_ids":…,"types":…}  -> hangs, no response at 60 s
+POST /api/bundle/genome/ {"genome_ids":…,"types":…}  -> 400 "Missing Bundled Types"
+```
+
+The 400 is the *correct* endpoint rejecting a deliberately-wrong body shape
+(`routes/download.js:168` wants `bundleTypes`); the hang is the wrong endpoint trying to
+parse a bundle request as an RQL query.
+
+**It is latent, not live.** `execute()` reaches `executeBundleDownload` only when
+`format.category === 'package'` or `spec.bundleConfig` is set, and `DownloadFormats.js`
+defines no `package` category at all — only `accession` (6), `sequence` (7) and `table` (3).
+No format is type `'bundle'`, so `GenomeBundleConfiguratorStep` never runs and
+`bundleConfig` is never populated. The path is unreachable today.
+
+Fix it anyway, before anyone enables a bundle format and hits a 60 s hang with no error.
+The matcher question that prompted this resolves itself: once the URL is right, it is still
+under `dataServiceURL`, so `isDataApi()` matches and the provider wraps it. Whether a
+*job-submission* call should be retried is a separate judgement — probably not, since a
+resubmitted job is worse than a failed one. If so it needs an explicit opt-out rather than
+relying on an accident of URL shape.
 
 ### Verification
 
@@ -214,7 +255,9 @@ download path.
 
 ## Suggested order
 
-1. **Item 1** — mechanical, unblocks everything else, low risk.
+1. **Item 1 + 1a** — mechanical, unblocks everything else, low risk. 1a is an unrelated
+   latent bug found while checking Item 1; fix it in the same pass since it is three
+   characters and the alternative is someone discovering it as a 60-second hang.
 2. **Item 4** — biggest user-visible improvement, reuses shipped code.
 3. **Item 3** — small, but only meaningful once chunked downloads are actually reachable.
 4. **Item 2** — needs usage data before committing; (b) is the likely answer.
