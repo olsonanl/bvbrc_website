@@ -159,8 +159,10 @@ define([
       var rqlQuery = this.context.queryDescriptor.rqlQuery || '';
       var countUrl = baseUrl + dataType + '/?select(id)&limit(1)&' + rqlQuery;
 
-      // Use xhr to get count from Content-Range header
-      require(['dojo/request/xhr'], function (xhr) {
+      // dojo/request, NOT dojo/request/xhr: the plain module resolves through
+      // p3/util/throttledRequest, so this count query gets 429/503 retry.
+      // The raw transport would bypass the provider entirely.
+      require(['dojo/request'], function (xhr) {
         xhr(countUrl, {
           handleAs: 'json',
           headers: {

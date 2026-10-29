@@ -3,7 +3,11 @@ define([
   'dojo/_base/lang',
   'dojo/Deferred',
   'dojo/when',
-  'dojo/request/xhr',
+  // dojo/request, NOT dojo/request/xhr: the plain module resolves through
+  // p3/util/throttledRequest (registered as dojoConfig.requestProvider), which
+  // is what gives these calls 429/503 retry. Importing the raw transport opts
+  // out of it -- see CLAUDE.md "There is no single request funnel".
+  'dojo/request',
   'dojo/dom-construct',
   'dojo/topic',
   './DownloadFormats',

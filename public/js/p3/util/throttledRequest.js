@@ -53,8 +53,11 @@ define([
     // dojo/request's contract is a *dual* promise: the data promise plus a
     // .response sub-promise (request/util.js:146). Delegating preserved that
     // for free; wrapping in retryRequest does not, so rebuild it from the
-    // winning attempt. Dropping it breaks consumers inside dojo/dgrid even
-    // though no p3 call site reads it directly.
+    // winning attempt. dojo/dgrid reads it internally, and so does
+    // widget/download/RecordSelectorStep.js, which calls
+    // `.response.then(r => r.getHeader('Content-Range'))` to size a download --
+    // hence the passthrough of the real response object rather than a
+    // synthesised one, which would have no getHeader (xhr.js:238).
     var winning;
     var dataPromise = retryRequest(function () {
       winning = xhr(url, options);
