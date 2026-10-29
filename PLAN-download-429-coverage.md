@@ -12,42 +12,78 @@ of the plan — see "What the server actually does" before reading the proposals
 
 ## What the server actually does
 
-The earlier plan assumed downloads were the *most* exposed path: heaviest requests, no
-retry, so the first thing to fix. Half of that is right and half is wrong.
+**Revised 2026-10-29 (second pass).** The first pass measured a broad download running
+past 120 s and built the plan around that. That measurement was already stale when I took
+it: BV-BRC-API **#245** (batched join streaming) and **#255** (the distributed path that
+was discarding the batched stream) had landed, and alpha now completes those downloads.
+Re-measured below. Anything in this document that reads as "the download hangs" is
+superseded.
 
-### Downloads are classified heavy, and that is deliberate
+Sources: `Docs/CLIENT-join-too-broad.md`, `Docs/CLIENT-429.md`, and
+`Docs/RELEASE_NOTES_DRAFT.md` in BV-BRC-API.
 
-`p3_api/middleware/QueryClassifier.js:87` — `req.isDownload` is heavy by construction,
-before any `rows` inspection. The comment explains why: *"a download fans out to ~370
-secondary lookups per genome"*, and admission control exists to bound concurrent
-amplification. So under admission control a download **can** be shed with a 429.
+### Downloads are classified heavy, so 429 is real
 
-### But downloads are exempt from the join guard, on purpose
+`middleware/QueryClassifier.js:87` — `req.isDownload` is heavy by construction, before any
+`rows` inspection, because *"a download fans out to ~370 secondary lookups per genome"*.
 
-`middleware/JoinResolution.js:100,119` exempt `isDownload` from the `join_too_broad`
-rejection. The comment is explicit:
-
-> *A grid page must stay fast or fail fast — nobody wants a 25-row page that takes five
-> minutes — whereas a download is already understood to be a long operation, and "slow but
-> reliable" beats "refused".*
-
-Measured on alpha, same filter (Viruses, `genome_sequence`):
+**Admission control is now ENABLED on alpha**, which the first pass listed as an open
+question. Measured via `scripts/verify-protections.js`:
 
 ```
-grid-style  POST /genome_sequence/            -> 400 join_too_broad in ~1.5 s
-download    POST /genome_sequence/?http_download=true -> still running at 120 s (client timeout)
+PASS  admission pools reported at /stats
+      heavy 3 slots / 6 queue, interactive 20/20
+PASS  enforcement active — queryAdmission.enabled is true
 ```
 
-**This matters more than the 429 question.** The failure a user actually hits on a broad
-download today is not a 429 — it is a request that runs until something times out. Adding
-retry logic to that does nothing.
+Three heavy slots, six queued. A handful of concurrent broad downloads will exhaust that,
+and each one now takes *minutes* rather than failing fast — so 429s on the download path
+are reachable today, not hypothetical. This makes Items 1 and 3 live work rather than
+preparation.
+
+### Broad downloads now COMPLETE — they do not hang
+
+The exemption at `JoinResolution.js:100,119` is real, but the consequence has changed.
+#245 added `BatchedJoinStream`, which resolves an over-broad join in bounded slices
+instead of refusing it; #255 fixed the distributed path discarding that stream. Measured
+on alpha 2026-10-29, Viruses / `genome_sequence`:
+
+| request | result |
+|---|---|
+| grid-style count query | **400** `join_too_broad` in 1.2 s |
+| download, `limit(200)` | **200**, 42 KB, 3.6 s |
+| download, `limit(10000)` | **200**, 2.48 MB, **12 s** |
+
+The release notes record the before/after for that last one: **HTTP 524 after 125 s →
+HTTP 200 in ~5 s**, and a full 2,500,000-record protein FASTA of taxon 10239 completing
+through Chrome and Cloudflare.
+
+So the asymmetry is deliberate and *working*: a page fails fast, a download succeeds
+slowly. A client must not read the page's 400 as a prediction about the download. (The
+first implementation of Item 4 did exactly that and had to be reverted — see the commit
+history.)
+
+### Not every broad taxon is refused any more
+
+`joinResolution.taxonomicRewrite` resolves some large taxa without the join. Measured:
+
+```
+taxon 10239 (Viruses)   -> 400 join_too_broad   0.13 s
+taxon 1239  (Bacillota) -> 200                  6.0 s
+taxon 2     (Bacteria)  -> 400 join_too_broad   0.45 s
+```
+
+`verify-protections.js` currently *fails* its own "broad taxon 1239 refused promptly"
+check for this reason. The contract's instruction stands: **handle a 400 on any taxon and
+let the server decide which** — never hardcode the list.
 
 ### What this changes
 
-The original §4 framing — "downloads are unretryable, convert them to XHR+Blob so they can
-retry" — solves the smaller problem. The ordering below reflects that: the cheap mechanical
-fixes first, the genuinely useful UX work second, and the expensive conversion last and
-only if the evidence supports it.
+The original §4 framing — "downloads are unretryable, convert them to XHR+Blob" — solved
+the wrong problem, and the "warn the user it will hang" framing of the first revision
+solved a problem that no longer exists. What is actually left is narrower and more
+ordinary: make the download path honour the 429 contract like everything else, and tell
+the user that a long download is progressing rather than stuck.
 
 ---
 
@@ -61,10 +97,12 @@ of its four XHR sites get 429 handling:
 
 | line | call | what it is |
 |---|---|---|
-| 303 | `xhr.post(sourceUrl, …)` | cross-collection prefetch, 120 s timeout |
-| 396 | `xhr.post(DATA_API_URL + …)` | `executeClientSideDownload`, 300 s timeout |
-| 477 | `xhr.post(BUNDLER_API_URL + …)` | `executeBundleDownload`, 60 s timeout |
-| 583 | `xhr.post(DATA_API_URL + …)` | `executeChunkedDownload` per chunk, 120 s |
+| 317 | `xhr.post(sourceUrl, …)` | cross-collection prefetch, 120 s timeout |
+| 410 | `xhr.post(DATA_API_URL + …)` | `executeClientSideDownload`, 300 s timeout |
+| 508 | `xhr.post(BUNDLER_API_URL + …)` | `executeBundleDownload`, 60 s timeout |
+| 614 | `xhr.post(DATA_API_URL + …)` | `executeChunkedDownload` per chunk, 120 s |
+
+(Line numbers as of this revision; they move. `grep -n 'xhr.post' public/js/p3/util/DownloadExecutor.js`.)
 
 `widget/download/RecordSelectorStep.js` has the same direct import.
 
@@ -137,13 +175,13 @@ topics, so no UI work is needed here.
 
 **Effort: medium. Risk: medium. This is the real decision.**
 
-`DownloadExecutor.js:256` builds a hidden form and calls `form.submit()`. The response goes
+`DownloadExecutor.js:270` builds a hidden form and calls `form.submit()`. The response goes
 to the browser, not to JS, so no amount of client code can see its status, retry it, or
 report it. The user gets a browser-rendered error page or a failed download.
 
 ### It is the default for everything
 
-`execute()` at line 783:
+`execute()` at line 807:
 
 ```javascript
 var preferServerSide = format.serverSide !== false;
@@ -175,10 +213,29 @@ navigate away.
 
 ### Three options, in the order I would consider them
 
-**(a) Do nothing to the transport; fix the user-visible failure instead.** See Item 4. The
-honest observation is that a browser-handled download already *has* a failure UI — the
-browser's own — and the thing users actually lack is any signal before they commit to a
-download that will not work.
+**(a) Do nothing to the transport.** This is now the strongest option, and the second-pass
+measurements are why.
+
+The server-side streaming path is the one the API team has been hardening: batched joins
+(#245), the distributed-path fix (#255), deterministic results (#254), and a 2,500,000-row
+protein FASTA verified end to end through Chrome and Cloudflare. A client-side Blob path
+reproduces none of that and inherits none of the fixes.
+
+Three concrete costs of moving off it, from the release notes:
+
+- **No resume, and no way to signal it.** Interrupted downloads must be restarted.
+  Chrome offers a Resume button regardless, which yields a zero-byte file. A client-side
+  path has the same limitation with *less* of the server's streaming behaviour behind it.
+- **Determinism is a server property.** Repeated downloads of the same query now return
+  identical records (#254) because the batched join passes the caller's `sort` to Solr.
+  Re-chunking client-side with our own `limit(n,offset)` loop does not inherit that, and
+  offset paging over a batched join is not obviously stable at all.
+- **Cloudflare's ~100 s silence limit** is survived by the streaming serializers emitting
+  early. A client-side path that assembles then saves has a different failure profile
+  against the same proxy.
+
+Retry on a download is worth having, but not at the price of leaving the path the server
+actually supports.
 
 **(b) Raise `CLIENT_SIDE_LIMIT` and flip the small formats.** `CLIENT_SIDE_LIMIT` is 25,000,
 which at 289 B/row is ~7 MB — comfortably safe. Flipping `serverSide: false` on tabular
@@ -228,37 +285,51 @@ this — it never escalates concurrency, which is what the spec prohibits.
 
 ---
 
-## Item 4 — tell the user before they commit to a download that cannot work
+## Item 4 — set expectations for a long download (DONE, after one wrong turn)
 
-**Effort: medium. Risk: low. Highest user value of the four.**
+**Status: implemented.** Worth reading the correction, because the mistake is the kind
+this codebase invites.
 
-This is the item the measurements promoted. The actual failure today is not a 429 — it is a
-broad download that runs until something times out, with no indication it was doomed.
+The first implementation read the count query's `400 join_too_broad` as a prediction that
+the download would fail, and **blocked the Download button**. That was wrong: the download
+succeeds (see above), so it denied users a file the server was willing to produce. The
+contract says so explicitly — *"If the UI offers 'download these results' next to a
+too-broad grid, the download is worth offering even when the grid is refused."* Reverted.
 
-The wizard already knows `spec.totalCount` before submitting (it drives `isLargeDataset`).
-So it can tell the user what they are about to do:
+What ships instead: `RecordSelectorStep` notes that the selection could not be counted up
+front and warns the download may take several minutes, then gets out of the way. No gate,
+no drill-down — offering "narrow your filter" beside a working download would mislead.
 
-- **Under `CLIENT_SIDE_LIMIT`** — proceed silently, as now.
-- **Large but bounded** — "This will export ~N rows and may take several minutes." Set
-  expectations rather than letting a long wait read as a hang.
-- **Over the join guard's limit, with a `genome(...)` filter** — this is the case that will
-  hang. The grid behind it has already been refused with `join_too_broad` and knows the
-  genome count and limit. Reuse `util/joinTooBroad.js` and `widget/JoinTooBroadMessage.js`
-  from #1475 to say so *in the wizard*, with the same taxon drill-down, instead of
-  submitting a form that will time out.
+Two things make the note worth having rather than noise:
 
-That last point is the strongest connection between this work and what already shipped: the
-machinery to explain it is written, tested, and on alpha. It just is not wired into the
-download path.
+- **There is genuinely no count.** A batched join never computes `numFound`
+  (`CLIENT-join-too-broad.md`), so "All matching" is the honest label and the step cannot
+  show a number even in principle.
+- **The wait is real.** Minutes, not seconds, for a large taxon.
+
+### Still open in this area
+
+- **Cloudflare cuts a response after ~100 s of silence.** The streaming serializers emit
+  early and keep emitting, so this holds — but the *client* must show indeterminate
+  progress, not a spinner that looks hung. `DownloadProgressDialog` currently has no
+  signal for a batched download, which is Item 3 territory.
+- **Interrupted downloads cannot be resumed, and Chrome offers a Resume button anyway.**
+  Clicking it produces a zero-byte file with no error. The release notes treat this as
+  documentation-only — `Accept-Ranges: none` does not suppress the affordance, and
+  advertising `Accept-Ranges` while ignoring `Range` makes Chrome **retry forever without
+  advancing**. If the wizard ever grows post-download guidance, "restart, do not resume"
+  belongs there. **Do not** attempt a client-side range/resume feature.
+- **Batched downloads are deterministic but not globally sorted.** `sort()` orders within
+  each slice, not across the file (release notes, PR #254). If any UI copy promises sorted
+  output for a large export, it is wrong for this path.
 
 ---
 
 ## Suggested order
 
-1. **Item 1 + 1a** — mechanical, unblocks everything else, low risk. 1a is an unrelated
-   latent bug found while checking Item 1; fix it in the same pass since it is three
-   characters and the alternative is someone discovering it as a 60-second hang.
-2. **Item 4** — biggest user-visible improvement, reuses shipped code.
+1. **Item 1 + 1a — DONE.** Mechanical; 1a was an unrelated latent bug found while
+   checking Item 1 and fixed in the same pass.
+2. **Item 4 — DONE**, after one wrong turn (see that section).
 3. **Item 3** — small, but only meaningful once chunked downloads are actually reachable.
 4. **Item 2** — needs usage data before committing; (b) is the likely answer.
 
@@ -278,6 +349,17 @@ engineering one.
 - **Does `retryRequest` need timeout-budget awareness?** Relevant wherever a caller sets an
   explicit `timeout:` and retries eat into it. Not a problem today at 3 retries, but it
   becomes one in `unattended` mode where backoff can reach 300 s.
-- **Is admission control actually enabled on alpha for downloads?** `enableThrottleRetry` is
-  off by default client-side, and the API ships admission control disabled. Items 1 and 3
-  are untestable end-to-end until both are on somewhere.
+- ~~**Is admission control actually enabled on alpha?**~~ **Answered: yes.**
+  `verify-protections.js` reports `queryAdmission.enabled is true`, heavy 3 slots / 6
+  queue, interactive 20/20. Note those are **per worker** — alpha runs 3, so published
+  figures must be slots x workers, and production's worker count must be confirmed
+  separately rather than assumed to match (release notes).
+- **Should `enableThrottleRetry` be turned on for the website?** It is still `false` by
+  default client-side. With admission control live on alpha and three heavy slots, a few
+  concurrent broad downloads can shed — so the retry contract is now load-bearing rather
+  than speculative. This is a deployment decision, not a code one.
+- **Does the download progress UI survive a multi-minute batched download?** Cloudflare
+  cuts after ~100 s of silence; the server keeps emitting, but
+  `DownloadProgressDialog` has no signal for a batched stream and may look hung. Item 3.
+- **Should any UI copy promise sorted output for large exports?** Batched downloads sort
+  *within* slices, not globally (#254). If it does, it is wrong for that path.
