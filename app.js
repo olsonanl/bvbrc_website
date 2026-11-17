@@ -164,6 +164,7 @@ app.use(function (req, res, next) {
     cartoBasemapApiKey: config.get('cartoBasemapApiKey') || '',
     queryLoggingEnabled: !!config.get('queryLogDir'),
     enableThrottleRetry: config.get('enableThrottleRetry') || false,
+    useCursorPaging: config.get('useCursorPaging') || false,
     fastaFormatPresetsPath: config.get('fastaFormatPresetsPath') || ''
   };
   // console.log("Application Options: ", req.applicationOptions);
